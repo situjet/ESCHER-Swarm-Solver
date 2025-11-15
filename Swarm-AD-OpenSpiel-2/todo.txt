@@ -1,0 +1,14 @@
+Modified game logic:
+1. The game is now 2 waves of attack, rather than one.
+
+The game loop is to be adjusted as follows:
+1. Player 1 places down AD in the same manner as before. Player 0 is unaware of the position of the AD.
+2. Player 0 sends out however many drones it wants out of a total ammunition capacity. They can place them at any integer point on the top row, and designate the target.
+3. Player 1 receives all of Player 0's actions, and now decides what to intercept out of a total interception ammo capacity. They are unaware of Player 0's total ammo, and vice versa.
+
+Compute the game in the same manner. However, if a drone or AD "see" each other (enter the AD's range), the AD is discovered, and is now a possible viable target for Player 0 in the next wave.
+
+4. Player 0 now sends all remaining drones in the same manner as before.
+5. Player 1 sends all remaining interceptors, decides, etc. Any interception ammunition left over is to be given a point value (+ defender)
+
+The same exists for the large game.
