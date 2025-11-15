@@ -23,21 +23,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-ticks", type=int, default=35, help="Maximum ticks per iteration")
     parser.add_argument("--dry-run", action="store_true", help="Print table instead of sending CoT")
     parser.add_argument("--export-file", default=None, help="Optional CoT XML output path")
+    parser.add_argument(
+        "--origin-lat",
+        type=float,
+        default=38.8895,
+        help="Latitude for the northwest grid origin (default: Washington, DC Mall)",
+    )
+    parser.add_argument(
+        "--origin-lon",
+        type=float,
+        default=-77.0353,
+        help="Longitude for the northwest grid origin (default: Washington, DC Mall)",
+    )
+    parser.add_argument(
+        "--altitude-ft",
+        type=int,
+        default=200,
+        help="Altitude (feet) for CoT points",
+    )
     return parser.parse_args()
 
 
-def build_bundle(seed: int | None) -> ScenarioBundle:
-    scenario_cfg = ScenarioConfig(seed=seed)
+def build_bundle(args: argparse.Namespace) -> ScenarioBundle:
+    scenario_cfg = ScenarioConfig(seed=args.seed)
     return ScenarioBundle(
         grid=GridConfig(),
         scenario=scenario_cfg,
-        geo=GeoConfig(),
+        geo=GeoConfig(
+            origin_lat=args.origin_lat,
+            origin_lon=args.origin_lon,
+            altitude_ft=args.altitude_ft,
+        ),
     )
 
 
 def main() -> None:
     args = parse_args()
-    bundle = build_bundle(args.seed)
+    bundle = build_bundle(args)
     runtime = PyTakRuntimeConfig(
         cot_endpoint=args.cot_endpoint,
         cot_callsign_prefix=args.callsign_prefix,

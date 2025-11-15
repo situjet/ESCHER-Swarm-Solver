@@ -7,6 +7,7 @@ __pycache__/
 .venv/
 venv/
 ENV/
+Visualizer/.venv_wsl/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/

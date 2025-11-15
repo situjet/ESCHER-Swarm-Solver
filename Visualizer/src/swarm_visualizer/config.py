@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, validator
 
@@ -27,7 +27,7 @@ class ScenarioConfig(BaseModel):
     target_values: Tuple[int, int, int] = (10, 20, 40)
     tot_offsets: Tuple[int, int, int] = (0, 2, 4)
     ad_kill_probability: float = 0.5
-    seed: int | None = None
+    seed: Optional[int] = None
 
     @validator("ad_kill_probability")
     def validate_probability(cls, value: float) -> float:
@@ -46,7 +46,7 @@ class PyTakRuntimeConfig(BaseModel):
     cot_endpoint: str = Field("udp://127.0.0.1:6969", description="CoT endpoint for WinTAK")
     cot_callsign_prefix: str = Field("SWARM", description="Prefix for UID/callsigns.")
     dry_run: bool = Field(False, description="Print CoT without transmitting.")
-    export_file: str | None = Field(None, description="Optional path to write CoT stream.")
+    export_file: Optional[str] = Field(None, description="Optional path to write CoT stream.")
     step_delay: float = Field(1.0, description="Seconds between CoT snapshots.")
 
     def to_pytak_config(self) -> Dict[str, str]:

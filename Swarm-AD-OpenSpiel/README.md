@@ -1,7 +1,7 @@
 # Swarm Air-Defense Game
 
 This folder contains a sequential, two-player OpenSpiel environment that captures
-an attacker-defender interaction between a six-drone swarm and a layered air
+an attacker-defender interaction between a ten-drone swarm and a layered air
 defense (two autonomous AD launchers plus three manned interceptors). The game
 was designed to prototype the scenario described in the hackathon brief and to
 serve as a lightweight testbed for the ESCHER solver.
@@ -14,16 +14,20 @@ serve as a lightweight testbed for the ESCHER solver.
 2. **Defender (player 1)** places two autonomous AD launchers anywhere on the
    bottom half as long as both row and column indices are even (stride-2 lattice).
    Each launcher automatically engages the earliest drone whose path crosses its
-   4-cell circular radius; shots succeed with 50% probability.
-3. **Attacker (player 0)** allocates six drones sequentially. Every drone must
+   5-cell circular radius; the kill chance follows `1 - exp(-r * L)` where `L`
+   is the path length a drone flies inside the bubble and `r` defaults to 0.9.
+3. **Attacker (player 0)** allocates ten drones sequentially. Every drone must
    launch from row 0 (any column), select either one of the three target clusters
    or one of the AD sites as its objective, and choose a time-on-target (ToT)
    offset from {0s, +2s, +4s}. The ToT acts as a delay before the drone departs
    row 0, so later choices literally arrive later in the engagement timeline.
 4. **Defender (player 1)** receives the full attack plan and assigns three
    interceptors. Each interceptor can engage one surviving drone, with a “pass”
-   option if fewer than three intercepts are desired.
-5. **Chance** resolves autonomous AD shots (50% success). Drones that were tasked
+   option if fewer than three intercepts are desired. Interceptors are assumed
+   to launch from row 15 and sprint up-range at twice the drone’s speed; if the
+   geometry shows they cannot physically meet the drone before it impacts a
+   target, the engagement is treated as a miss even if the action was selected.
+5. **Chance** resolves autonomous AD shots via the probabilistic rule above. Drones that were tasked
    against an AD and survive the intercept+AD gauntlet will destroy that launcher
    on arrival, removing it from the fight. Drones that reach a target cluster
    contribute the cluster’s value as damage. The game is zero-sum: attacker payoff
@@ -58,7 +62,25 @@ The script will:
 Use `pyspiel.load_game("swarm_defense")` to plug the environment into ESCHER or
 any other OpenSpiel solver. The `SwarmDefenseState.snapshot()` helper exposes a
 structured view of the targets, AD unit status (alive/destroyed and by whom),
-drone destinations, and outcomes for debugging and visualization.
+drone destinations, AD intercept footprints, and (when successful) the precise
+coordinates and timestamps where interceptors killed a drone. The console
+output now also reports how many drones were killed by ADs vs. interceptors vs.
+those that slipped through, and the snapshot overlays the same breakdown.
+AD kills now appear as bright yellow `X` markers connected back to the firing
+launcher with a dotted tether and labeled `AD#→D#` time stamps, while
+interceptor kills show up as cyan stars. If you do not see those overlays in
+`Visualizer/swarm_defense_demo.png`, ensure you regenerated the image after
+updating the repository.
+
+### Tuning and diagnostics
+
+- Set `SWARM_AD_KILL_RATE=<float>` before launching a simulation to bump the AD
+   lethality up or down without editing code (default `0.9`).
+- Run `python Swarm-AD-OpenSpiel/tools/kill_rate_report.py --episodes 200 --policy demo`
+   from WSL to batch-roll episodes and print aggregate kill percentages for the
+   demo heuristics (use `--policy random` to stress-test the model with random
+   play). This utility mirrors the verification workflow used while calibrating
+   the probabilistic AD system.
 
 ## State-space explorer
 

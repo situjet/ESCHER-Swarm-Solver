@@ -18,6 +18,10 @@ class DroneState:
     tot_offset: int
     time_on_target: Optional[int]
     payload_value: int
+    kill_source: Optional[str]
+    kill_tick: Optional[int]
+    kill_x: Optional[int]
+    kill_y: Optional[int]
 
 
 @dataclass

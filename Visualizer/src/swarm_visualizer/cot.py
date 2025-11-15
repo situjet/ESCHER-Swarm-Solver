@@ -74,6 +74,8 @@ def snapshot_to_cot(
             cot_type = "a-f-A-M-F-C"
         elif drone.status is DroneStatus.DESTROYED:
             cot_type = "a-f-A-M-F-K"
+            if drone.kill_source:
+                remarks += f" | killed by {drone.kill_source}"
         events.append(
             format_cot_event(
                 uid=f"{prefix}-{drone.drone_id}",
@@ -84,6 +86,22 @@ def snapshot_to_cot(
                 remarks=remarks,
             )
         )
+        if drone.kill_source and drone.kill_x is not None and drone.kill_y is not None:
+            kill_lat, kill_lon = grid_to_latlon(drone.kill_x, drone.kill_y, grid, geo)
+            kill_tick = f" @t={drone.kill_tick}" if drone.kill_tick is not None else ""
+            events.append(
+                format_cot_event(
+                    uid=f"{prefix}-{drone.drone_id}-kill",
+                    callsign=f"{prefix}-{drone.drone_id}-K",
+                    cot_type="b-m-p-s-k",
+                    lat=kill_lat,
+                    lon=kill_lon,
+                    remarks=f"Kill site for {drone.drone_id}{kill_tick} via {drone.kill_source}",
+                    hae=0,
+                    ce=10,
+                    le=10,
+                )
+            )
 
     for interceptor in snapshot.interceptors:
         lat, lon = grid_to_latlon(interceptor.x, interceptor.y, grid, geo)
