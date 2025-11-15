@@ -10,6 +10,7 @@ This package builds a lightweight OpenSpiel-inspired scenario simulator and publ
 - **Air Defense:** 2 AD units positioned on an 8×8 stride lattice. Each has a 50% probabilistic kill if an attacker crosses its envelope.
 - **Targets:** 3 value-tiered clusters seeded randomly across the bottom half of the grid.
 - **Game Engine:** Deterministic movement with stochastic AD outcomes. The simulator produces a `GameHistory` compatible with OpenSpiel-style policies.
+- **Kill Markers:** Destroyed attackers now retain their kill site, shooter, and intercept tick; CoT feeds emit dedicated kill icons so you can see exactly where interceptors and AD batteries scored hits.
 
 ## Quick Start
 
@@ -56,6 +57,24 @@ swarm-visualizer --iterations 1 --cot-endpoint udp://127.0.0.1:6969 --dry-run
 - `--dry-run` – Print CoT XML payloads instead of sending them.
 - `--export-file cot_log.xml` – Archive CoT stream for offline analysis.
 - `--iterations 10` – Chain multiple simulated matches.
+- `--origin-lat / --origin-lon / --altitude-ft` – Reposition the grid anywhere on earth. Defaults place the scenario over the Washington, DC National Mall so it is easy to spot from WinTAK.
+
+### Washington, DC example (WSL → WinTAK)
+
+```bash
+wsl bash -lc 'cd "/mnt/c/Users/<you>/path/to/Visualizer" \
+    && source .venv_wsl/bin/activate \
+    && swarm-visualizer \
+             --cot-endpoint udp+wo://172.17.128.1:6969 \
+             --origin-lat 38.8895 \
+             --origin-lon -77.0353 \
+             --step-delay 0.75 \
+             --iterations 1'
+```
+
+- Replace `172.17.128.1` with the Windows host IP shown by `ip route | grep default` inside WSL.
+- Use the `udp+wo://` scheme when streaming from WSL so PyTak opens a write-only socket and does not attempt to bind the Windows address.
+- If you prefer a different city, pass the appropriate latitude/longitude pair; all attackers, BLUFOR interceptors, AD units, and targets will render around that anchor point.
 
 ## Testing
 

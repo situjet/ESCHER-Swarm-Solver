@@ -1,6 +1,7 @@
 pytak>=5.2
 pydantic>=2.8
 rich>=13.7
+cryptography>=46.0
 
 [dev]
 pytest>=7.4

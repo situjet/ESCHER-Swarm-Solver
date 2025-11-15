@@ -53,6 +53,10 @@ class SwarmGameSimulator:
                 tot_offset=drone.tot_offset,
                 time_on_target=drone.time_on_target,
                 payload_value=drone.payload_value,
+                kill_source=drone.kill_source,
+                kill_tick=drone.kill_tick,
+                kill_x=drone.kill_position.x if drone.kill_position else None,
+                kill_y=drone.kill_position.y if drone.kill_position else None,
             )
             for drone in self.scenario.attackers
         ]
@@ -127,19 +131,19 @@ class SwarmGameSimulator:
                 continue
             ad.mark_engagement(drone.drone_id)
             if self._rng.random() <= self.bundle.scenario.ad_kill_probability:
-                drone.mark_destroyed()
+                drone.mark_destroyed(current_time=self._current_time, source=f"AD:{ad.ad_id}")
                 break
 
     def _advance_interceptors(self) -> None:
         assignments = self._rank_attackers_by_priority()
-        for interceptor, drone in zip(self.scenario.interceptors, assignments, strict=False):
+        for interceptor, drone in zip(self.scenario.interceptors, assignments):
             if drone is None:
                 interceptor.assigned_drone = None
                 continue
             interceptor.assigned_drone = drone.drone_id
             interceptor.advance(drone.position)
             if interceptor.position == drone.position and drone.status is DroneStatus.ACTIVE:
-                drone.mark_destroyed()
+                drone.mark_destroyed(current_time=self._current_time, source=f"INT:{interceptor.interceptor_id}")
 
     def _rank_attackers_by_priority(self) -> List[Drone | None]:
         active_drones = [d for d in self.scenario.attackers if d.status is DroneStatus.ACTIVE]

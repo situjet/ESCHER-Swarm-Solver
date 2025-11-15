@@ -12,17 +12,20 @@ import pyspiel
 import swarm_defense_game  # noqa: F401  # Registers the custom game.
 
 
-def _count_outcomes(drones) -> Tuple[int, int, int]:
-    ad = inter = surv = 0
+def _count_outcomes(drones) -> Tuple[int, int, int, int]:
+    ad = inter = surv = ad_attrit = 0
     for drone in drones:
         destroyed_by = drone.get("destroyed_by") or ""
         if isinstance(destroyed_by, str) and destroyed_by.startswith("ad"):
-            ad += 1
+            if destroyed_by.startswith("ad:"):
+                ad += 1
+            else:
+                ad_attrit += 1
         elif isinstance(destroyed_by, str) and destroyed_by.startswith("interceptor"):
             inter += 1
         else:
             surv += 1
-    return ad, inter, surv
+    return ad, inter, surv, ad_attrit
 
 
 def _run_random_episode(seed: int):
@@ -81,16 +84,16 @@ def main() -> None:
     per_episode = []
     for i in range(args.episodes):
         state = runner(args.seed + i)
-        ad, inter, surv = _count_outcomes(state.snapshot()["drones"])
-        totals.update({"ad": ad, "interceptor": inter, "survivor": surv})
-        per_episode.append((ad, inter, surv))
+        ad, inter, surv, ad_attrit = _count_outcomes(state.snapshot()["drones"])
+        totals.update({"ad": ad, "interceptor": inter, "survivor": surv, "ad_attrit": ad_attrit})
+        per_episode.append((ad, inter, surv, ad_attrit))
 
-    drones_per_episode = sum(per_episode[0]) if per_episode else 0
+    drones_per_episode = sum(per_episode[0][:3]) if per_episode else 0
     print("Episodes:", args.episodes)
     print("Policy:", args.policy)
     print("Totals:", dict(totals))
     if totals:
-        total_drones = sum(totals.values())
+        total_drones = totals["ad"] + totals["interceptor"] + totals["survivor"]
         print(
             "Rates:",
             {
@@ -100,15 +103,17 @@ def main() -> None:
             },
         )
     if per_episode:
-        avg_ad = sum(ad for ad, _, _ in per_episode) / args.episodes
-        avg_inter = sum(inter for _, inter, _ in per_episode) / args.episodes
-        avg_surv = sum(surv for _, _, surv in per_episode) / args.episodes
+        avg_ad = sum(ad for ad, _, _, _ in per_episode) / args.episodes
+        avg_inter = sum(inter for _, inter, _, _ in per_episode) / args.episodes
+        avg_surv = sum(surv for _, _, surv, _ in per_episode) / args.episodes
+        avg_attrit = sum(attr for _, _, _, attr in per_episode) / args.episodes
         print(
             "Per-episode averages:",
             {
                 "ad": round(avg_ad, 2),
                 "interceptor": round(avg_inter, 2),
                 "survivor": round(avg_surv, 2),
+                "ad_attrit": round(avg_attrit, 2),
                 "drones": drones_per_episode,
             },
         )

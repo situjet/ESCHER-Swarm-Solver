@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+import contextlib
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
@@ -55,7 +56,7 @@ class PyTakStreamer:
         self.runtime = runtime
 
     async def stream(self, history: GameHistory) -> None:
-        batches = list(
+        batches = tuple(
             iter_history_as_cot(
                 history.snapshots,
                 grid=self.bundle.grid,
@@ -82,7 +83,13 @@ class PyTakStreamer:
         )
         tx_worker = await pytak.txworker_factory(tx_queue, config_section)
 
-        await asyncio.gather(history_worker.run(), tx_worker.run())
+        tx_task = asyncio.create_task(tx_worker.run())
+        try:
+            await history_worker.run()
+        finally:
+            tx_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await tx_task
 
     def stream_sync(self, history: GameHistory) -> None:
         asyncio.run(self.stream(history))

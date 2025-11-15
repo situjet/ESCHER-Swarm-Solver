@@ -64,13 +64,26 @@ class Drone:
     tot_offset: int = 0
     time_on_target: Optional[int] = None
     payload_value: int = 1
+    kill_position: Optional[GridPosition] = None
+    kill_tick: Optional[int] = None
+    kill_source: Optional[str] = None
 
     def advance(self) -> None:
         if self.status is DroneStatus.ACTIVE:
             self.position = self.next_position
 
-    def mark_destroyed(self) -> None:
+    def mark_destroyed(
+        self,
+        *,
+        current_time: Optional[int] = None,
+        source: Optional[str] = None,
+    ) -> None:
         self.status = DroneStatus.DESTROYED
+        self.kill_position = self.position
+        if current_time is not None:
+            self.kill_tick = current_time
+        if source:
+            self.kill_source = source
 
     def mark_completed(self, current_time: int) -> None:
         self.status = DroneStatus.COMPLETED

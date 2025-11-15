@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -29,18 +30,62 @@ TOT_PALETTE = {
     TOT_CHOICES[2]: "tab:purple",
 }
 
+AD_KILL_COLOR = "#FF3B30"
+AD_KILL_EDGE = "black"
+AD_KILL_LINK = "#8C1B13"
+INTERCEPTOR_KILL_COLOR = "tab:cyan"
+TARGET_KILL_COLOR = "#F1C40F"
+TARGET_KILL_EDGE = "#7D6608"
+TARGET_KILL_MARKER = "P"
 
-def _count_outcomes(drones: Tuple[Dict[str, object], ...]) -> Tuple[int, int, int]:
-    ad = inter = surv = 0
+
+def _compute_target_kill_status(
+    drones: Tuple[Dict[str, object], ...], targets: Tuple[object, ...]
+) -> Tuple[Dict[str, object], ...]:
+    statuses = []
+    for _ in targets:
+        statuses.append({
+            "destroyed": False,
+            "time": None,
+            "drone": None,
+            "damage": 0.0,
+        })
+
+    for idx, drone in enumerate(drones):
+        target_idx = drone.get("target_idx")
+        if target_idx is None or target_idx >= len(statuses):
+            continue
+        if not drone.get("strike_success"):
+            continue
+        entry_row, entry_col = drone["entry"]
+        dest_row, dest_col = drone["destination"]
+        tot_value = float(drone.get("tot", 0.0))
+        arrival_time = tot_value + math.dist((entry_row, entry_col), (dest_row, dest_col))
+        status = statuses[target_idx]
+        if (not status["destroyed"]) or (arrival_time < status["time"]):
+            status.update(
+                destroyed=True,
+                time=arrival_time,
+                drone=idx,
+                damage=float(drone.get("damage_inflicted") or 0.0),
+            )
+    return tuple(statuses)
+
+
+def _count_outcomes(drones: Tuple[Dict[str, object], ...]) -> Tuple[int, int, int, int]:
+    ad = inter = surv = ad_target = 0
     for drone in drones:
         destroyed_by = drone.get("destroyed_by") or ""
         if isinstance(destroyed_by, str) and destroyed_by.startswith("ad"):
-            ad += 1
+            if destroyed_by.startswith("ad:"):
+                ad += 1
+            else:
+                ad_target += 1
         elif isinstance(destroyed_by, str) and destroyed_by.startswith("interceptor"):
             inter += 1
         else:
             surv += 1
-    return ad, inter, surv
+    return ad, inter, surv, ad_target
 
 
 def _sample_chance_action(state: SwarmDefenseState, rng: random.Random) -> int:
@@ -148,7 +193,8 @@ def render_snapshot(state: SwarmDefenseState, output_path: Path) -> None:
     targets = snapshot["targets"]
     drones = snapshot["drones"]
     ad_units = snapshot["ad_units"]
-    ad_kills, interceptor_kills, survivors = _count_outcomes(drones)
+    target_statuses = _compute_target_kill_status(drones, targets)
+    ad_kills, interceptor_kills, survivors, ad_attrit = _count_outcomes(drones)
 
     fig, ax = plt.subplots(figsize=(8, 8))
     grid = np.zeros((GRID_SIZE, GRID_SIZE))
@@ -176,12 +222,44 @@ def render_snapshot(state: SwarmDefenseState, output_path: Path) -> None:
     for row, col in AD_POSITION_CANDIDATES:
         ax.scatter(col, row, s=10, color="tab:blue", alpha=0.3)
 
+    destroyed_target_label_added = False
     for idx, target in enumerate(targets):
-        ax.scatter(target.col, target.row, s=200, color="tab:green", marker="o")
-        ax.text(target.col + 0.2, target.row + 0.2, f"T{idx}\nV={target.value}", color="black")
+        status = target_statuses[idx]
+        destroyed = status["destroyed"]
+        if destroyed:
+            label = None
+            if not destroyed_target_label_added:
+                label = "Destroyed target"
+                destroyed_target_label_added = True
+            time_str = f"{status['time']:.1f}" if status["time"] is not None else "?"
+            ax.scatter(
+                target.col,
+                target.row,
+                s=260,
+                marker=TARGET_KILL_MARKER,
+                color=TARGET_KILL_COLOR,
+                edgecolors=TARGET_KILL_EDGE,
+                linewidths=1.8,
+                zorder=6,
+                label=label,
+            )
+            caption = f"T{idx}\nV={target.value}\nD{status['drone']} t={time_str}"
+        else:
+            ax.scatter(target.col, target.row, s=200, color="tab:green", marker="o", zorder=4)
+            caption = f"T{idx}\nV={target.value}"
+        ax.text(
+            target.col + 0.2,
+            target.row + 0.2,
+            caption,
+            color="black",
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.6, "edgecolor": "none"} if destroyed else None,
+        )
 
+    ad_positions: Dict[int, Tuple[float, float]] = {}
     for idx, unit in enumerate(ad_units):
         col, row = unit["position"][1], unit["position"][0]
+        ad_positions[idx] = (col, row)
         alive = bool(unit["alive"])
         color = "tab:blue" if alive else "tab:gray"
         marker = "^" if alive else "v"
@@ -189,7 +267,8 @@ def render_snapshot(state: SwarmDefenseState, output_path: Path) -> None:
         status = "alive" if alive else f"KO ({unit.get('destroyed_by') or 'drone'})"
         ax.text(col - 0.6, row - 0.4, f"AD{idx}\n{status}", color=color, fontsize=8)
 
-    intercept_label_added = False
+    ad_kill_label_added = False
+    interceptor_kill_label_added = False
     for idx, drone in enumerate(drones):
         entry_col, entry_row = drone["entry"][1], drone["entry"][0]
         tgt_row, tgt_col = drone["destination"]
@@ -211,33 +290,71 @@ def render_snapshot(state: SwarmDefenseState, output_path: Path) -> None:
             f"D{idx}\nToT={tot}",
             color=color,
         )
-        for ad_idx, intercept in drone["intercepts"]:
-            hit_row, hit_col = intercept
+        for ad_idx, intercept_point, intercept_time in drone["intercepts"]:
+            hit_row, hit_col = intercept_point
             label = None
-            if not intercept_label_added:
-                label = "Intercept"
-                intercept_label_added = True
+            if not ad_kill_label_added:
+                label = "AD kill"
+                ad_kill_label_added = True
+            ad_col, ad_row = ad_positions.get(ad_idx, (None, None))
+            if ad_col is not None and ad_row is not None:
+                ax.plot(
+                    [ad_col, hit_col],
+                    [ad_row, hit_row],
+                    color=AD_KILL_LINK,
+                    linestyle=":",
+                    linewidth=1.4,
+                    alpha=0.85,
+                    zorder=3,
+                )
             ax.scatter(
                 hit_col,
                 hit_row,
-                color=color,
-                marker="x",
-                s=80,
-                linewidths=2,
+                facecolors=AD_KILL_COLOR,
+                edgecolors=AD_KILL_EDGE,
+                marker="X",
+                s=180,
+                linewidths=1.3,
                 label=label,
+                zorder=10,
             )
             ax.text(
                 hit_col + 0.1,
                 hit_row + 0.1,
-                f"AD{ad_idx}",
-                color=color,
+                f"AD{ad_idx}→D{idx}\nT={intercept_time:.1f}",
+                color="black",
                 fontsize=7,
+                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
             )
+        if drone["destroyed_by"] == "interceptor" and drone.get("interceptor_hit"):
+            hit_row, hit_col = drone["interceptor_hit"]
+            label = None
+            if not interceptor_kill_label_added:
+                label = "Interceptor kill"
+                interceptor_kill_label_added = True
+            ax.scatter(
+                hit_col,
+                hit_row,
+                color=INTERCEPTOR_KILL_COLOR,
+                marker="*",
+                s=120,
+                linewidths=1.5,
+                edgecolors="black",
+                label=label,
+            )
+            if drone.get("interceptor_time") is not None:
+                ax.text(
+                    hit_col + 0.1,
+                    hit_row - 0.3,
+                    f"t={drone['interceptor_time']:.1f}",
+                    color="tab:cyan",
+                    fontsize=7,
+                )
 
         ax.text(
             0.02,
             0.05,
-            f"AD kills: {ad_kills}\nInterceptor kills: {interceptor_kills}\nSurvivors: {survivors}",
+            f"AD kills: {ad_kills}\nInterceptor kills: {interceptor_kills}\nAD-target strikes: {ad_attrit}\nSurvivors: {survivors}",
             transform=ax.transAxes,
             fontsize=9,
             bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
@@ -258,13 +375,16 @@ def main() -> None:
     state, seed = play_episode(args.seed)
     render_snapshot(state, OUTPUT_PATH)
     returns = state.returns()
-    ad_kills, interceptor_kills, survivors = _count_outcomes(state.snapshot()["drones"])
+    ad_kills, interceptor_kills, survivors, ad_attrit = _count_outcomes(state.snapshot()["drones"])
     print("Episode complete.")
     print(f"Seed used: {seed}")
     print(f"Attacker damage: {returns[0]:.1f}")
     print(f"Defender reward: {returns[1]:.1f}")
     print(
-        f"Breakdown -> AD kills: {ad_kills}, Interceptor kills: {interceptor_kills}, Survivors: {survivors}"
+        "Breakdown -> AD kills: {ad} (intercepts), AD-target strikes: {attrit}, "
+        "Interceptor kills: {inter}, Survivors: {surv}".format(
+            ad=ad_kills, attrit=ad_attrit, inter=interceptor_kills, surv=survivors
+        )
     )
     print(f"Snapshot saved to: {OUTPUT_PATH}")
 
