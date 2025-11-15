@@ -1,6 +1,7 @@
 """Custom OpenSpiel game modeling a swarm attack vs. layered air defense."""
 from __future__ import annotations
 
+import copy
 import itertools
 import math
 import os
@@ -223,6 +224,41 @@ class SwarmDefenseState(pyspiel.State):
         self._next_ad_resolution_index = 0
         self._returns = [0.0, 0.0]
 
+    def __deepcopy__(self, memo):
+        """Optimized deepcopy for faster state cloning."""
+        cls = self.__class__
+        new_state = cls.__new__(cls)
+        memo[id(self)] = new_state
+        
+        # Call parent init
+        pyspiel.State.__init__(new_state, self.get_game())
+        
+        # Copy primitives directly
+        new_state._phase = self._phase
+        new_state._interceptor_steps = self._interceptor_steps
+        new_state._next_ad_resolution_index = self._next_ad_resolution_index
+        
+        # Shallow copy lists of primitives/tuples
+        new_state._history = self._history[:]
+        new_state._target_positions = self._target_positions[:]
+        new_state._returns = self._returns[:]
+        
+        # Copy dataclass lists - targets are frozen so shallow copy is fine
+        new_state._targets = self._targets[:]
+        
+        # AD units and drone plans have nested lists, need proper copy
+        new_state._ad_units = [
+            ADUnit(u.row, u.col, u.alive, u.destroyed_by, u.intercept_log[:])
+            for u in self._ad_units
+        ]
+        new_state._drone_plans = [
+            DronePlan(p.entry_row, p.entry_col, p.target_idx, p.tot_idx, p.destroyed_by, p.intercepts[:])
+            for p in self._drone_plans
+        ]
+        new_state._pending_ad_targets = self._pending_ad_targets[:]
+        
+        return new_state
+
     def phase(self) -> Phase:
         return self._phase
 
@@ -268,7 +304,7 @@ class SwarmDefenseState(pyspiel.State):
             return 1
         return 0
 
-    def legal_actions(self, player: Optional[int] = None) -> List[int]:
+    def _legal_actions(self, player: Optional[int] = None) -> List[int]:
         if self._phase == Phase.TERMINAL:
             return []
         if self._phase == Phase.TARGET_POSITIONS:
@@ -304,6 +340,9 @@ class SwarmDefenseState(pyspiel.State):
             return [AD_RESOLVE_ACTION_BASE, AD_RESOLVE_ACTION_BASE + 1]
         return []
 
+    def legal_actions(self, player: Optional[int] = None) -> List[int]:
+        return self._legal_actions(player)
+
     def chance_outcomes(self) -> List[Tuple[int, float]]:
         if self._phase == Phase.TARGET_POSITIONS:
             remaining = [
@@ -332,7 +371,7 @@ class SwarmDefenseState(pyspiel.State):
             ]
         return []
 
-    def apply_action(self, action: int) -> None:
+    def _apply_action(self, action: int) -> None:
         self._history.append(action)
         if self._phase == Phase.TARGET_POSITIONS:
             self._apply_target_position_action(action)
@@ -348,6 +387,9 @@ class SwarmDefenseState(pyspiel.State):
             self._apply_ad_resolution(action)
         else:
             raise ValueError("Cannot apply actions in terminal state")
+
+    def apply_action(self, action: int) -> None:
+        return self._apply_action(action)
 
     def _apply_target_position_action(self, action: int) -> None:
         cell = _decode_target_position_action(action)
@@ -548,6 +590,44 @@ class SwarmDefenseState(pyspiel.State):
     def information_state_string(self, player: int) -> str:
         return self.observation_string(player)
 
+    def information_state_tensor(self, player: int) -> List[float]:
+        tensor = []
+        # Phase encoding (7 values for 7 phases)
+        for p in Phase:
+            tensor.append(1.0 if self._phase == p else 0.0)
+        # Target positions (NUM_TARGETS * 2 for row, col)
+        for i in range(NUM_TARGETS):
+            if i < len(self._targets):
+                tensor.extend([self._targets[i].row / GRID_SIZE, self._targets[i].col / GRID_SIZE])
+            else:
+                tensor.extend([0.0, 0.0])
+        # Target values
+        for i in range(NUM_TARGETS):
+            if i < len(self._targets):
+                tensor.append(self._targets[i].value / max(TARGET_VALUE_OPTIONS))
+            else:
+                tensor.append(0.0)
+        # AD units (NUM_AD_UNITS * 3 for row, col, alive)
+        for i in range(NUM_AD_UNITS):
+            if i < len(self._ad_units):
+                unit = self._ad_units[i]
+                tensor.extend([unit.row / GRID_SIZE, unit.col / GRID_SIZE, 1.0 if unit.alive else 0.0])
+            else:
+                tensor.extend([0.0, 0.0, 0.0])
+        # Drone plans (NUM_ATTACKING_DRONES * 4 for entry_col, target_idx, tot_idx, alive)
+        for i in range(NUM_ATTACKING_DRONES):
+            if i < len(self._drone_plans):
+                plan = self._drone_plans[i]
+                tensor.extend([
+                    plan.entry_col / GRID_SIZE,
+                    plan.target_idx / DRONE_TARGET_SLOTS,
+                    plan.tot_idx / len(TOT_CHOICES),
+                    0.0 if plan.destroyed_by else 1.0
+                ])
+            else:
+                tensor.extend([0.0, 0.0, 0.0, 0.0])
+        return tensor
+
     def action_to_string(self, player: Optional[int], action: int) -> str:
         if TARGET_POSITION_ACTION_BASE <= action < TARGET_VALUE_ACTION_BASE:
             row, col = _decode_target_position_action(action)
@@ -595,9 +675,9 @@ _GAME_TYPE = pyspiel.GameType(
     max_num_players=2,
     min_num_players=2,
     provides_information_state_string=True,
-    provides_information_state_tensor=False,
+    provides_information_state_tensor=True,
     provides_observation_string=True,
-    provides_observation_tensor=False,
+    provides_observation_tensor=True,
     parameter_specification={},
 )
 
@@ -626,9 +706,6 @@ class SwarmDefenseGame(pyspiel.Game):
 
     def new_initial_state(self) -> SwarmDefenseState:
         return SwarmDefenseState(self)
-
-    def make_py_observer(self, iig_obs_type=None, params=None):
-        return pyspiel.IIGObserverForPublicInfo(iig_obs_type, params)
 
 
 pyspiel.register_game(_GAME_TYPE, SwarmDefenseGame)
