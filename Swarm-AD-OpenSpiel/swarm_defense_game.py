@@ -322,6 +322,7 @@ class SwarmDefenseState(pyspiel.State):
         self._history: List[int] = []
         self._target_positions: List[Tuple[int, int]] = []
         self._targets: List[TargetCluster] = []
+        self._target_destroyed: List[bool] = []
         self._ad_units: List[ADUnit] = []
         self._drone_plans: List[DronePlan] = []
         self._interceptor_steps = 0
@@ -344,6 +345,7 @@ class SwarmDefenseState(pyspiel.State):
         return {
             "phase": self._phase.name,
             "targets": tuple(self._targets),
+            "target_destroyed": tuple(self._target_destroyed),
             "ad_units": tuple(
                 {
                     "position": (unit.row, unit.col),
@@ -531,6 +533,7 @@ class SwarmDefenseState(pyspiel.State):
             )
             for i in range(NUM_TARGETS)
         ]
+        self._target_destroyed = [False] * len(self._targets)
         self._phase = Phase.AD_PLACEMENT
 
     def _apply_ad_action(self, action: int) -> None:
@@ -661,6 +664,8 @@ class SwarmDefenseState(pyspiel.State):
         self._pending_target_strikes.clear()
         self._next_target_strike_index = 0
         self._damage_from_targets = 0.0
+        if len(self._target_destroyed) != len(self._targets):
+            self._target_destroyed = [False] * len(self._targets)
         for idx, plan in enumerate(self._drone_plans):
             if plan.target_idx < len(self._targets):
                 plan.damage_inflicted = 0.0
@@ -684,10 +689,21 @@ class SwarmDefenseState(pyspiel.State):
         plan = self._drone_plans[strike.drone_idx]
         success = action == AD_RESOLVE_ACTION_BASE + 1
         plan.strike_success = success
-        if success:
-            value = self._targets[strike.target_idx].value
+        target_idx = strike.target_idx
+        target_destroyed = (
+            0 <= target_idx < len(self._target_destroyed)
+            and self._target_destroyed[target_idx]
+        )
+        if (
+            success
+            and 0 <= target_idx < len(self._targets)
+            and not target_destroyed
+        ):
+            value = self._targets[target_idx].value
             plan.damage_inflicted += value
             self._damage_from_targets += value
+            if 0 <= target_idx < len(self._target_destroyed):
+                self._target_destroyed[target_idx] = True
         self._next_target_strike_index += 1
         if self._next_target_strike_index >= len(self._pending_target_strikes):
             self._pending_target_strikes.clear()

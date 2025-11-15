@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Sequence
 
 from .config import GeoConfig, GridConfig, PyTakRuntimeConfig
@@ -10,7 +10,7 @@ from .entities import DroneStatus
 from .history import GameStateSnapshot
 
 COT_XML_TEMPLATE = (
-    '<event version="2.0" uid="{uid}" type="{cot_type}" time="{time}" start="{time}" stale="{stale}" how="m-g">'
+    '<event version="2.0" uid="{uid}" type="{cot_type}" time="{time}" start="{start}" stale="{stale}" how="m-g">'
     "<point lat=\"{lat:.6f}\" lon=\"{lon:.6f}\" hae=\"{hae}\" ce=\"{ce}\" le=\"{le}\"/>"
     "<detail><contact callsign=\"{callsign}\"/>"
     "<remarks>{remarks}</remarks>"
@@ -18,8 +18,10 @@ COT_XML_TEMPLATE = (
 )
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _cot_timestamp(dt: datetime) -> str:
+    """Return a TAK-friendly ISO-8601 timestamp with millisecond precision."""
+
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def grid_to_latlon(x: int, y: int, grid: GridConfig, geo: GeoConfig) -> tuple[float, float]:
@@ -40,13 +42,15 @@ def format_cot_event(
     le: int = 20,
     remarks: str = "",
 ) -> str:
-    timestamp = _now_iso()
-    stale_time = _now_iso()
+    now = datetime.now(timezone.utc)
+    start_time = now
+    stale_time = now + timedelta(minutes=2)
     return COT_XML_TEMPLATE.format(
         uid=uid,
         cot_type=cot_type,
-        time=timestamp,
-        stale=stale_time,
+        time=_cot_timestamp(now),
+        start=_cot_timestamp(start_time),
+        stale=_cot_timestamp(stale_time),
         lat=lat,
         lon=lon,
         hae=hae,
