@@ -74,18 +74,18 @@ def main() -> None:
         num_traversals = 10
         num_val_traversals = 5
         num_workers = 1
-        batch_size_regret = 10
-        batch_size_value = 10
-        batch_size_policy = 10
+        batch_size_regret = 60
+        batch_size_value = 60
+        batch_size_policy = 60
         train_steps = 50
     else:
         print("🚀 PRODUCTION MODE: Full training configuration\n")
-        num_iterations = 20
+        num_iterations = 8
         num_traversals = 100
-        num_val_traversals = 20
+        num_val_traversals = 10
         num_workers = 1  # Parallel tree traversal workers (CPU cores)
-        batch_size_regret = 128
-        batch_size_value = 32  # Reduced: 20 traversals → ~40-80 samples (was 128)
+        batch_size_regret = 50
+        batch_size_value = 40  # Reduced: 20 traversals → ~40-80 samples (was 128)
         batch_size_policy = 64  # Reduced to ensure enough samples (was 128)
         train_steps = 200
     

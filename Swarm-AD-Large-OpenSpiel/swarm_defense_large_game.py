@@ -39,8 +39,8 @@ except ImportError:  # pragma: no cover - fallback for script execution
         smooth_path,
     )
 
-ARENA_WIDTH = 24.0
-ARENA_HEIGHT = 24.0
+ARENA_WIDTH = 32.0
+ARENA_HEIGHT = 32.0
 BOTTOM_START = ARENA_HEIGHT * 0.5
 NUM_TARGETS = 3
 NUM_AD_UNITS = 2
@@ -52,10 +52,8 @@ ENTRY_LANES = 24
 ENTRY_POINTS: List[Tuple[float, float]] = [(0.0, lane + 0.5) for lane in range(ENTRY_LANES)]
 LARGE_TOT_CHOICES: Tuple[float, ...] = (0.0, 1.5, 3.0, 4.5)
 AD_COVERAGE_RADIUS = 5.5
-AD_KILL_RATE = 1.6
+AD_KILL_RATE = .05
 AD_MIN_EFFECTIVE_EXPOSURE = 0.75
-AD_FOV_DEGREES = 120.0
-AD_ROTATION_TOLERANCE = 4.0
 INTERCEPTOR_LAUNCH_ROW = ARENA_HEIGHT + 2.0
 INTERCEPTOR_KILL_PROB = 0.95
 DRONE_VS_AD_KILL_PROB = 0.8
@@ -125,7 +123,6 @@ class ADUnit:
     col: float
     alive: bool = True
     destroyed_by: Optional[str] = None
-    orientation: float = math.pi / 2
     intercept_log: List[Tuple[int, Tuple[float, float], float]] = field(default_factory=list)
 
 
@@ -160,7 +157,6 @@ class ADIntercept:
     probability: float
     hit_point: Tuple[float, float]
     intercept_time: float
-    direction: float
 
 
 @dataclass
@@ -601,13 +597,20 @@ class SwarmDefenseLargeState(pyspiel.State):
             self._synchronize_tot_schedule()
         self._pending_ad_targets.clear()
         engaged: set[int] = set()
+        engagements: List[ADIntercept] = []
         for ad_idx, ad_unit in enumerate(self._ad_units):
             if not ad_unit.alive:
                 continue
-            intercept = self._select_drone_for_ad(ad_idx, engaged)
-            if intercept is not None:
+            while True:
+                intercept = self._select_drone_for_ad(ad_idx, engaged)
+                if intercept is None:
+                    break
                 engaged.add(intercept.drone_idx)
-                self._pending_ad_targets.append(intercept)
+                engagements.append(intercept)
+        engagements.sort(key=lambda intercept: (intercept.intercept_time, intercept.ad_idx, intercept.drone_idx))
+        self._pending_ad_targets.extend(engagements)
+        for events in self._ad_orientation_events.values():
+            events.sort(key=lambda entry: entry[0])
         if not self._pending_ad_targets:
             self._start_drone_ad_strike_resolution()
         else:
@@ -648,7 +651,7 @@ class SwarmDefenseLargeState(pyspiel.State):
         ad_unit = self._ad_units[ad_idx]
         position = (ad_unit.row, ad_unit.col)
         best_sort: Optional[Tuple[float, float, int]] = None
-        best_payload: Optional[ADIntercept] = None
+        best_payload: Optional[Tuple[int, Tuple[float, float], float, float, float]] = None
         for idx, plan in enumerate(self._drone_plans):
             if plan.destroyed_by is not None or idx in engaged:
                 continue
@@ -660,28 +663,29 @@ class SwarmDefenseLargeState(pyspiel.State):
             direction = _angle_between(position, entry_point)
             if intercept_time >= arrival_time:
                 continue
-            effective_exposure = max(exposure, AD_MIN_EFFECTIVE_EXPOSURE)
-            probability = 1.0 - math.exp(-AD_KILL_RATE * effective_exposure)
-            probability = max(0.0, min(1.0, probability))
-            if probability <= 0.0:
-                continue
             distance_to_entry = math.dist(position, entry_point)
             sort_key = (distance_to_entry, intercept_time, idx)
             if best_sort is None or sort_key < best_sort:
                 best_sort = sort_key
-                best_payload = ADIntercept(
-                    ad_idx=ad_idx,
-                    drone_idx=idx,
-                    exposure=exposure,
-                    probability=probability,
-                    hit_point=entry_point,
-                    intercept_time=intercept_time,
-                    direction=direction,
-                )
-        if best_payload is not None:
-            self._ad_units[ad_idx].orientation = best_payload.direction
-            self._record_orientation_event(ad_idx, best_payload.intercept_time, best_payload.direction)
-        return best_payload
+                best_payload = (idx, entry_point, intercept_time, exposure, direction)
+        if best_payload is None:
+            return None
+        drone_idx, entry_point, intercept_time, exposure, direction = best_payload
+        effective = max(exposure, AD_MIN_EFFECTIVE_EXPOSURE)
+        probability = 1.0 - math.exp(-AD_KILL_RATE * effective)
+        probability = max(0.0, min(1.0, probability))
+        intercept = ADIntercept(
+            ad_idx=ad_idx,
+            drone_idx=drone_idx,
+            exposure=exposure,
+            probability=probability,
+            hit_point=entry_point,
+            intercept_time=intercept_time,
+            direction=direction,
+        )
+        self._ad_units[ad_idx].orientation = direction
+        self._record_orientation_event(ad_idx, intercept_time, direction)
+        return intercept
 
     def _path_exposure_stats(
         self, plan: DronePlan, ad_pos: Tuple[float, float]

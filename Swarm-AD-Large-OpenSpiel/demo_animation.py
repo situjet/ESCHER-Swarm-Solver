@@ -230,19 +230,14 @@ def _max_time(series: Sequence[DroneSeries]) -> float:
 
 def _orientation_from_events(
     base_orientation: float,
-    events: Sequence[Tuple[float, float, float, float]],
+    events: Sequence[Tuple[float, float]],
     t: float,
 ) -> float:
     orientation = base_orientation
-    for start_time, end_time, start_dir, end_dir in events:
-        if t < start_time:
+    for event_time, direction in events:
+        if t < event_time:
             break
-        if end_time > start_time and start_time <= t <= end_time:
-            span = max(end_time - start_time, 1e-6)
-            ratio = min(max((t - start_time) / span, 0.0), 1.0)
-            return _interpolate_angle(start_dir, end_dir, ratio)
-        if t >= end_time:
-            orientation = end_dir
+        orientation = direction
     return orientation
 
 
@@ -271,7 +266,8 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
     for unit in ad_units:
         row, col = unit["position"]
         base_orientation = float(unit.get("orientation", math.pi / 2))
-        events: Sequence[Tuple[float, float, float, float]] = unit.get("orientation_events", ())
+        raw_events: Sequence[Tuple[float, float]] = unit.get("orientation_events", ())
+        events = sorted(raw_events, key=lambda item: item[0])
         arrow = patches.FancyArrowPatch(
             (col, row),
             (col, row),
@@ -293,9 +289,11 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
     drone_markers = [ax.scatter(ser.entry[1], ser.entry[0], color=ser.color, s=50) for ser in series]
     path_lines = [ax.plot([], [], color=ser.color, linewidth=2)[0] for ser in series]
     kill_markers: List[Optional[object]] = []
+    kill_pulses: List[Optional[patches.Circle]] = []
     for ser in series:
         if ser.kill_point is None:
             kill_markers.append(None)
+            kill_pulses.append(None)
             continue
         row, col = ser.kill_point
         if ser.kill_type == "ad":
@@ -310,6 +308,7 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
                 alpha=0.0,
                 zorder=6,
             )
+            pulse_color = AD_KILL_COLOR
         elif ser.kill_type == "interceptor":
             marker = ax.scatter(
                 col,
@@ -322,6 +321,7 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
                 alpha=0.0,
                 zorder=6,
             )
+            pulse_color = INTERCEPTOR_KILL_COLOR
         else:
             marker = ax.scatter(
                 col,
@@ -334,7 +334,19 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
                 alpha=0.0,
                 zorder=6,
             )
+            pulse_color = AD_TARGET_KILL_COLOR
         kill_markers.append(marker)
+        pulse = patches.Circle(
+            (col, row),
+            radius=0.0,
+            fill=False,
+            linewidth=1.5,
+            edgecolor=pulse_color,
+            alpha=0.0,
+            zorder=5,
+        )
+        ax.add_patch(pulse)
+        kill_pulses.append(pulse)
     time_text = ax.text(0.01, 0.02, "t=0.0", transform=ax.transAxes)
 
     def _update(frame_idx: int):
@@ -357,13 +369,35 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
                     marker.set_alpha(1.0)
                 else:
                     marker.set_alpha(0.0)
+            pulse = kill_pulses[idx]
+            if pulse is not None and ser.destroyed_time is not None:
+                if current_time < ser.destroyed_time:
+                    pulse.set_alpha(0.0)
+                    pulse.set_radius(0.0)
+                else:
+                    pulse_age = current_time - ser.destroyed_time
+                    if pulse_age <= 1.5:
+                        pulse.set_alpha(max(0.0, 1.0 - pulse_age / 1.5))
+                        pulse.set_radius(0.2 + pulse_age * 0.8)
+                    else:
+                        pulse.set_alpha(0.0)
+                        pulse.set_radius(0.0)
+            elif pulse is not None:
+                pulse.set_alpha(0.0)
+                pulse.set_radius(0.0)
         for data in ad_arrows:
             orientation = _orientation_from_events(data["base"], data["events"], current_time)
             end_col = data["col"] + arrow_length * math.cos(orientation)
             end_row = data["row"] + arrow_length * math.sin(orientation)
             data["arrow"].set_positions((data["col"], data["row"]), (end_col, end_row))
-        artists = drone_markers + path_lines + [data["arrow"] for data in ad_arrows] + [time_text]
+        artists = (
+            drone_markers
+            + path_lines
+            + [data["arrow"] for data in ad_arrows]
+            + [time_text]
+        )
         artists.extend(marker for marker in kill_markers if marker is not None)
+        artists.extend(pulse for pulse in kill_pulses if pulse is not None)
         return artists
 
     anim = animation.FuncAnimation(

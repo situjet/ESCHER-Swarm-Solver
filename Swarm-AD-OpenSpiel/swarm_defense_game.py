@@ -11,15 +11,15 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import pyspiel
 
-GRID_SIZE = 6
+GRID_SIZE = 16
 BOTTOM_HALF_START = GRID_SIZE // 2
-NUM_TARGETS = 1
-NUM_AD_UNITS = 1
-NUM_ATTACKING_DRONES = 4
-NUM_INTERCEPTORS = 1
+NUM_TARGETS = 3
+NUM_AD_UNITS = 2
+NUM_ATTACKING_DRONES = 10
+NUM_INTERCEPTORS = 5
 TOT_CHOICES: Tuple[float, ...] = (0.0, 2.0, 4.0)
 TARGET_VALUE_OPTIONS: Tuple[float, ...] = (10.0, 20.0, 40.0)
-AD_COVERAGE_RADIUS = 2.0
+AD_COVERAGE_RADIUS = 3.0
 AD_STRIDE = 2
 TARGET_SPEED = 1.0
 INTERCEPTOR_SPEED_MULTIPLIER = 2.0
@@ -661,13 +661,18 @@ class SwarmDefenseState(pyspiel.State):
     def _start_ad_resolution(self) -> None:
         self._pending_ad_targets.clear()
         engaged: set[int] = set()
+        engagements: List[ADIntercept] = []
         for ad_idx, ad_unit in enumerate(self._ad_units):
             if not ad_unit.alive:
                 continue
-            intercept = self._select_drone_for_ad(ad_idx, engaged)
-            if intercept is not None:
+            while True:
+                intercept = self._select_drone_for_ad(ad_idx, engaged)
+                if intercept is None:
+                    break
                 engaged.add(intercept.drone_idx)
-                self._pending_ad_targets.append(intercept)
+                engagements.append(intercept)
+        engagements.sort(key=lambda intercept: (intercept.intercept_time, intercept.ad_idx, intercept.drone_idx))
+        self._pending_ad_targets.extend(engagements)
         if not self._pending_ad_targets:
             self._start_drone_ad_strike_resolution()
         else:
@@ -781,7 +786,7 @@ class SwarmDefenseState(pyspiel.State):
         ad_unit = self._ad_units[ad_idx]
         position = (ad_unit.row, ad_unit.col)
         best_sort: Optional[Tuple[float, float, int]] = None
-        best_payload: Optional[Tuple[int, float, float, Tuple[float, float], float]] = None
+        best_payload: Optional[Tuple[int, Tuple[float, float], float, float]] = None
         for idx, plan in enumerate(self._drone_plans):
             if plan.destroyed_by is not None or idx in engaged:
                 continue
@@ -797,20 +802,17 @@ class SwarmDefenseState(pyspiel.State):
             arrival_time = _arrival_time_to_point(plan, destination)
             if intercept_time >= arrival_time:
                 continue
-            if intercept_time < self._ad_ready_time[ad_idx]:
-                continue
-            effective_exposure = max(exposure, AD_MIN_EFFECTIVE_EXPOSURE)
-            probability = 1.0 - math.exp(-AD_KILL_RATE * effective_exposure)
-            probability = max(0.0, min(1.0, probability))
-            if probability <= 0.0:
-                continue
-            sort_key = (intercept_time, -exposure, idx)
+            distance_to_entry = math.dist(position, entry_point)
+            sort_key = (distance_to_entry, intercept_time, idx)
             if best_sort is None or sort_key < best_sort:
                 best_sort = sort_key
-                best_payload = (idx, exposure, probability, entry_point, intercept_time)
+                best_payload = (idx, entry_point, intercept_time, exposure)
         if best_payload is None:
             return None
-        drone_idx, exposure, probability, entry_point, intercept_time = best_payload
+        drone_idx, entry_point, intercept_time, exposure = best_payload
+        effective = max(exposure, AD_MIN_EFFECTIVE_EXPOSURE)
+        probability = 1.0 - math.exp(-AD_KILL_RATE * effective)
+        probability = max(0.0, min(1.0, probability))
         return ADIntercept(
             ad_idx=ad_idx,
             drone_idx=drone_idx,
@@ -846,16 +848,10 @@ class SwarmDefenseState(pyspiel.State):
             plan.destroyed_by = f"ad:{intercept.ad_idx}"
             plan.intercepts.append((intercept.ad_idx, intercept.hit_point, intercept.intercept_time))
             ad_unit.intercept_log.append((intercept.drone_idx, intercept.hit_point, intercept.intercept_time))
-        self._ad_ready_time[intercept.ad_idx] = max(
-            self._ad_ready_time[intercept.ad_idx],
-            intercept.intercept_time + AD_REENGAGE_DELAY,
-        )
         self._next_ad_resolution_index += 1
         if self._next_ad_resolution_index >= len(self._pending_ad_targets):
             self._pending_ad_targets.clear()
             self._next_ad_resolution_index = 0
-            if self._start_ad_resolution():
-                return
             self._start_drone_ad_strike_resolution()
 
     def _finalize_returns(self) -> None:
