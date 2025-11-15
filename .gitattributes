@@ -1,0 +1,15 @@
+# Enforce LF endings for text files
+* text=auto eol=lf
+
+# Treat Python-specific files explicitly
+*.py text eol=lf
+*.ipynb text eol=lf
+
+# Keep binary data untouched
+*.npy binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zip binary

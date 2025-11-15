@@ -1,0 +1,70 @@
+# ESCHER Swarm Solver Visualizer
+
+This package builds a lightweight OpenSpiel-inspired scenario simulator and publishes game state snapshots to WinTAK using [PyTak](https://github.com/snstac/pytak). It focuses on a 16×16 battlespace with attacking drones, interceptors, and air-defense (AD) assets. The generated Cursor-on-Target (CoT) events let you validate swarm behaviors without hosting a TAK server.
+
+## Scenario Highlights
+
+- **Grid:** 16×16, origin at the northwest corner.
+- **Attackers:** 6 drones launched along the top row, each with a time-on-target (TOT) offset of +0 s, +2 s, or +4 s.
+- **Interceptors:** 3 blue-force drones that prioritize high-value attackers based on assigned targets and TOT.
+- **Air Defense:** 2 AD units positioned on an 8×8 stride lattice. Each has a 50% probabilistic kill if an attacker crosses its envelope.
+- **Targets:** 3 value-tiered clusters seeded randomly across the bottom half of the grid.
+- **Game Engine:** Deterministic movement with stochastic AD outcomes. The simulator produces a `GameHistory` compatible with OpenSpiel-style policies.
+
+## Quick Start
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # or .venv\\Scripts\\activate on Windows
+pip install -e .[dev]
+swarm-visualizer --iterations 1 --cot-endpoint udp://127.0.0.1:6969 --dry-run
+```
+
+- Remove `--dry-run` to stream CoT to WinTAK directly (ensure your TAK client listens on the same UDP endpoint).
+- Use `--export-file cot_log.xml` to persist the feed for later ingestion.
+
+## Project Layout
+
+```
+├── pyproject.toml
+├── README.md
+├── src
+│   └── swarm_visualizer
+│       ├── __init__.py
+│       ├── cli.py
+│       ├── config.py
+│       ├── cot.py
+│       ├── entities.py
+│       ├── history.py
+│       ├── scenario.py
+│       ├── simulator.py
+│       └── pytak_client.py
+└── tests
+    └── test_scenario.py
+```
+
+## WinTAK Testbench Workflow
+
+1. Launch WinTAK and ensure it is listening for UDP CoT traffic (Settings → Network → CoT → UDP Listener). Default: `udp://127.0.0.1:6969`.
+2. Run `swarm-visualizer --iterations 5 --cot-endpoint udp://127.0.0.1:6969`.
+3. Observe attacker, interceptor, and AD symbology appear on the WinTAK map. Each snapshot encodes the full board state with timestamps that honor the TOT offsets.
+
+## Advanced Options
+
+- `--seed 13` – Reproduce a deterministic random layout.
+- `--step-delay 1.0` – Control pacing (seconds) between snapshots.
+- `--dry-run` – Print CoT XML payloads instead of sending them.
+- `--export-file cot_log.xml` – Archive CoT stream for offline analysis.
+- `--iterations 10` – Chain multiple simulated matches.
+
+## Testing
+
+Run the pytest suite to validate grid constraints, AD logic, and CoT serialization:
+
+```bash
+pytest
+```
+
+## License
+
+MIT License © 2025 ESCHER Swarm Solver Team

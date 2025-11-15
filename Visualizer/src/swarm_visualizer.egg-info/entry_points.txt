@@ -1,0 +1,2 @@
+[console_scripts]
+swarm-visualizer = swarm_visualizer.cli:main
