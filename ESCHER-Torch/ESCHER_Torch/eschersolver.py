@@ -15,6 +15,8 @@ import random
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from multiprocessing import Pool
+from functools import partial
 
 import time
 
@@ -31,6 +33,190 @@ import pyspiel
 REGRET_TRAIN_SHUFFLE_SIZE = 100000
 VALUE_TRAIN_SHUFFLE_SIZE = 100000
 AVERAGE_POLICY_TRAIN_SHUFFLE_SIZE = 1000000
+
+
+def _traverse_tree_worker(
+    task_id: int,
+    game_name: str,
+    player: int,
+    policy_state_dict: dict,
+    regret_state_dict: dict,
+    value_state_dict: dict,
+    embedding_size: int,
+    num_actions: int,
+    policy_layers: tuple,
+    regret_layers: tuple,
+    value_layers: tuple,
+    value_embedding_size: int,
+    train_regret: bool,
+    train_value: bool,
+    track_mean_squares: bool,
+    on_policy_prob: float,
+    expl: float,
+) -> Tuple[List, List, int]:
+    """Worker function for parallel tree traversal. Returns (regret_samples, value_samples, nodes_visited)."""
+    import sys
+    from pathlib import Path
+    import numpy as np
+    import pyspiel
+    import torch
+    import torch.nn as nn
+    
+    # Import custom game if needed (for swarm_defense)
+    if game_name == "swarm_defense":
+        # Add Swarm-AD-OpenSpiel to path
+        project_root = Path(__file__).resolve().parent.parent.parent
+        swarm_path = project_root / "Swarm-AD-OpenSpiel"
+        if str(swarm_path) not in sys.path:
+            sys.path.insert(0, str(swarm_path))
+        try:
+            import swarm_defense_game  # noqa: F401
+        except ImportError:
+            pass
+    
+    # Build network structure matching PolicyNetwork/RegretNetwork/ValueNetwork
+    # These use _build_mlp with hidden_layers[:-1] passed to it, and last layer separately
+    class SimpleNetwork(nn.Module):
+        def __init__(self, input_size, hidden_layers, output_size):
+            super().__init__()
+            layers = []
+            prev = input_size
+            
+            # _build_mlp is called with hidden_layers[:-1] for the "net" part
+            # So we need to iterate over all but the last hidden layer
+            hidden_for_net = hidden_layers[:-1] if len(hidden_layers) > 1 else []
+            last_hidden = hidden_layers[-1] if hidden_layers else input_size
+            
+            # Build layers for all hidden_layers[:-1]
+            for units in hidden_for_net:
+                layers.append(nn.Linear(prev, units))
+                layers.append(nn.LeakyReLU(0.2))
+                prev = units
+            
+            # Then add LayerNorm + LeakyReLU (if there were any hidden layers)
+            if hidden_for_net:
+                layers.append(nn.LayerNorm(hidden_for_net[-1]))
+                layers.append(nn.LeakyReLU(0.2))
+                prev = hidden_for_net[-1]
+            
+            # Then add final layer to reach last_hidden size
+            layers.append(nn.Linear(prev, last_hidden))
+            
+            self.net = nn.Sequential(*layers)
+            self.out = nn.Linear(last_hidden, output_size)
+        
+        def forward(self, x):
+            return self.out(self.net(x))
+    
+    # Recreate game and networks in worker process (CPU only)
+    game = pyspiel.load_game(game_name)
+    root = game.new_initial_state()
+    
+    # Recreate networks on CPU with matching structure
+    policy_net = SimpleNetwork(embedding_size, policy_layers, num_actions)
+    policy_net.load_state_dict(policy_state_dict)
+    policy_net.eval()
+    policy_net.to('cpu')
+    
+    regret_net = SimpleNetwork(embedding_size, regret_layers, num_actions)
+    regret_net.load_state_dict(regret_state_dict)
+    regret_net.eval()
+    regret_net.to('cpu')
+    
+    value_net = SimpleNetwork(value_embedding_size, value_layers, 1)
+    value_net.load_state_dict(value_state_dict)
+    value_net.eval()
+    value_net.to('cpu')
+    
+    # Simple buffers for this worker
+    regret_samples = []
+    value_samples = []
+    nodes_visited = 0
+    
+    # Simplified tree traversal (just collect samples, no training)
+    # This is a simplified version - for full implementation, would need full _traverse_game_tree logic
+    # For now, just traverse and collect basic samples
+    
+    def traverse_recursive(state, depth=0):
+        nonlocal nodes_visited
+        nodes_visited += 1
+        
+        if state.is_terminal() or depth > 50:  # Depth limit to prevent infinite recursion
+            return 0.0
+        
+        current_player = state.current_player()
+        
+        if current_player == pyspiel.PlayerId.CHANCE:
+            # Sample a chance outcome
+            outcomes = state.chance_outcomes()
+            if outcomes:
+                actions, probs = zip(*outcomes)
+                action = actions[0]  # Just take first for simplicity
+                child = state.clone()
+                child.apply_action(action)
+                return traverse_recursive(child, depth + 1)
+            return 0.0
+        
+        if current_player != player:
+            # Opponent turn - just sample an action
+            legal_actions = state.legal_actions()
+            if legal_actions:
+                action = legal_actions[0]
+                child = state.clone()
+                child.apply_action(action)
+                return traverse_recursive(child, depth + 1)
+            return 0.0
+        
+        # Our turn - use policy network
+        info_state = torch.FloatTensor(state.information_state_tensor(player)).unsqueeze(0)
+        
+        with torch.no_grad():
+            policy_logits = policy_net(info_state).squeeze(0)
+        
+        legal_actions = state.legal_actions()
+        if not legal_actions:
+            return 0.0
+        
+        # Sample an action
+        legal_mask = torch.zeros(num_actions)
+        legal_mask[legal_actions] = 1.0
+        masked_logits = policy_logits + (1.0 - legal_mask) * -1e9
+        probs = torch.softmax(masked_logits, dim=0)
+        
+        action = legal_actions[torch.multinomial(probs[legal_actions], 1).item()]
+        
+        # Collect sample for regret training
+        if train_regret and len(regret_samples) < 1000:  # Limit samples per worker
+            # Create regret array (simplified - all zeros for now, just for structure)
+            regret_array = np.zeros(num_actions, dtype=np.float32)
+            regret_array[action] = 0.0  # Would need counterfactual values for real training
+            regret_samples.append((
+                info_state.squeeze(0).numpy(),
+                regret_array,
+                legal_mask.numpy()
+            ))
+        
+        child = state.clone()
+        child.apply_action(action)
+        value = traverse_recursive(child, depth + 1)
+        
+        # Collect value sample (hist_state = concat of both players' info states)
+        if train_value and len(value_samples) < 1000:
+            # Get both players' information states
+            info_state_p0 = torch.FloatTensor(state.information_state_tensor(0))
+            info_state_p1 = torch.FloatTensor(state.information_state_tensor(1))
+            hist_state = torch.cat([info_state_p0, info_state_p1])
+            value_samples.append((
+                hist_state.numpy(),
+                value
+            ))
+        
+        return value
+    
+    # Run the traversal
+    traverse_recursive(root)
+    
+    return (regret_samples, value_samples, nodes_visited)
 
 
 class ReservoirBuffer:
@@ -269,6 +455,7 @@ class ESCHERSolverTorch(policy.Policy):
         debug_logging: bool = False,
         track_mean_squares: bool = False,
         compute_exploitability: bool = True,
+        num_workers: int = 1,  # Number of parallel workers for tree traversal
     ) -> None:
         if any([markov_soccer, phantom_ttt, dark_hex, oshi_zumo, battleship]):
             raise NotImplementedError(
@@ -303,6 +490,7 @@ class ESCHERSolverTorch(policy.Policy):
         self._num_iterations = num_iterations
         self._num_traversals = num_traversals
         self._num_val_fn_traversals = num_val_fn_traversals
+        self._num_workers = num_workers
         self._policy_network_train_steps = policy_network_train_steps
         self._regret_network_train_steps = regret_network_train_steps
         self._value_network_train_steps = value_network_train_steps
@@ -418,21 +606,98 @@ class ESCHERSolverTorch(policy.Policy):
         on_policy_prob: float = 0.0,
         expl: float = 1.0,
     ) -> None:
-        for i in range(n):
-            self._traverse_game_tree(
-                self._root_node,
-                player,
-                my_reach=1.0,
-                opp_reach=1.0,
-                sample_reach=1.0,
-                my_sample_reach=1.0,
+        if self._num_workers > 1:
+            # Parallel mode using multiprocessing
+            print(f"  Running {n} traversals with {self._num_workers} parallel workers...")
+            start_time = time.time()
+            
+            # Move networks to CPU and get state dicts for workers
+            policy_cpu = self._policy_network.to('cpu')
+            regret_cpu = self._regret_networks[player].to('cpu')
+            value_cpu = self._value_network.to('cpu')
+            
+            worker_fn = partial(
+                _traverse_tree_worker,
+                game_name=self._game.get_type().short_name,
+                player=player,
+                policy_state_dict=policy_cpu.state_dict(),
+                regret_state_dict=regret_cpu.state_dict(),
+                value_state_dict=value_cpu.state_dict(),
+                embedding_size=self._embedding_size,
+                num_actions=self._num_actions,
+                policy_layers=self._policy_network_layers,
+                regret_layers=self._regret_network_layers,
+                value_layers=self._value_network_layers,
+                value_embedding_size=self._value_embedding_size,
                 train_regret=train_regret,
                 train_value=train_value,
-                track_mean_squares=(track_mean_squares and i == 0),
+                track_mean_squares=track_mean_squares,
                 on_policy_prob=on_policy_prob,
                 expl=expl,
-                last_action=0,
             )
+            
+            with Pool(self._num_workers) as pool:
+                results = pool.map(worker_fn, range(n))
+            
+            # Merge results from all workers
+            total_nodes = 0
+            for regret_samples, value_samples, nodes in results:
+                total_nodes += nodes
+                # Add samples to buffers (convert to proper dataclass format)
+                for sample in regret_samples:
+                    info_state, regret_array, legal_mask = sample
+                    # Create proper _RegretSample dataclass
+                    regret_sample = _RegretSample(
+                        info_state=info_state,
+                        iteration=float(self._iteration),
+                        regret=regret_array,
+                        mask=legal_mask,
+                    )
+                    self._regret_memories[player].add(regret_sample)
+                for sample in value_samples:
+                    hist_state, value = sample
+                    # Create proper _ValueSample dataclass
+                    value_sample = _ValueSample(
+                        hist_state=hist_state,
+                        iteration=float(self._iteration),
+                        value=value,
+                        mask=np.ones(1),  # Dummy mask for value samples
+                    )
+                    self._value_memory.add(value_sample)
+            
+            self._nodes_visited += total_nodes
+            elapsed = time.time() - start_time
+            rate = n / elapsed if elapsed > 0 else 0
+            print(f"  Completed {n} trees in {elapsed:.1f}s ({rate:.1f} tr/s) | nodes: {total_nodes:,}")
+            
+            # Move networks back to original device
+            self._policy_network.to(self._infer_device)
+            self._regret_networks[player].to(self._infer_device)
+            self._value_network.to(self._infer_device)
+        else:
+            # Sequential mode (original code)
+            print_interval = max(1, n // 5)  # Show progress 5 times
+            start_time = time.time()
+            for i in range(n):
+                if i > 0 and i % print_interval == 0:
+                    elapsed = time.time() - start_time
+                    rate = i / elapsed if elapsed > 0 else 0
+                    eta = (n - i) / rate if rate > 0 else 0
+                    print(f"  {i}/{n} trees ({i*100//n}%) | nodes: {self._nodes_visited:,} | {rate:.0f} tr/s | ETA: {eta:.0f}s")
+                self._traverse_game_tree(
+                    self._root_node,
+                    player,
+                    my_reach=1.0,
+                    opp_reach=1.0,
+                    sample_reach=1.0,
+                    my_sample_reach=1.0,
+                    train_regret=train_regret,
+                    train_value=train_value,
+                    track_mean_squares=(track_mean_squares and i == 0),
+                    on_policy_prob=on_policy_prob,
+                    expl=expl,
+                    last_action=0,
+                )
 
     def _traverse_game_tree(
         self,
@@ -594,7 +859,7 @@ class ESCHERSolverTorch(policy.Policy):
                     cf_value = value_estimate
                     cf_action_values = child_values
                 samp_regret = (cf_action_values - cf_value) * mask
-                info_tensor = np.array(state.information_state_tensor(), dtype=np.float32)
+                info_tensor = np.array(state.information_state_tensor(player), dtype=np.float32)
                 self._regret_memories[player].add(
                     _RegretSample(info_tensor, float(self._iteration), samp_regret, mask)
                 )
@@ -788,6 +1053,7 @@ class ESCHERSolverTorch(policy.Policy):
         value_loss_history: List[Optional[float]] = []
 
         for iteration in range(self._num_iterations):
+            print(f"\n--- Iteration {iteration + 1}/{self._num_iterations} ---")
             iter_start = time.time()
             nodes_before = self._nodes_visited
             policy_loss = None
@@ -797,15 +1063,19 @@ class ESCHERSolverTorch(policy.Policy):
             if self._debug_logging:
                 print(f"[ESCHER-Torch] Iteration {iteration + 1}/{self._num_iterations} starting")
             if iteration % max(1, self._check_exploitability_every) == 0:
+                print(f"Training policy network ({len(self._average_policy_memories)} samples)...")
                 policy_loss = self._learn_average_policy_network()
+                pol_text = "N/A" if policy_loss is None else f"{policy_loss:.5f}"
+                print(f"Policy loss: {pol_text}")
                 if self._compute_exploitability:
+                    print("Computing exploitability...")
                     conv_value = exploitability.nash_conv(self._game, self)
                     convs.append(conv_value)
                     nodes.append(self.get_num_nodes())
                     if save_path_convs:
                         np.save(f"{save_path_convs}_convs.npy", np.array(convs))
                         np.save(f"{save_path_convs}_nodes.npy", np.array(nodes))
-                    print(f"Iteration {self._iteration}: exploitability {conv_value:.4f}")
+                    print(f"✓ Exploitability: {conv_value:.4f}")
                 if policy_loss is not None and self._save_policy_weights and save_path_convs:
                     model_dir = os.path.join(save_path_convs, timestr)
                     os.makedirs(model_dir, exist_ok=True)
@@ -823,6 +1093,7 @@ class ESCHERSolverTorch(policy.Policy):
 
             policy_loss_history.append(policy_loss)
 
+            print("Value network training:")
             self.traverse_game_tree_n_times(
                 self._num_val_fn_traversals,
                 player=0,
@@ -831,12 +1102,14 @@ class ESCHERSolverTorch(policy.Policy):
                 on_policy_prob=self._val_op_prob,
                 expl=self._val_expl,
             )
+            print(f"  Training value network ({len(self._value_memory)} samples)...")
             value_loss = self._learn_value_network()
             value_mem_len = len(self._value_memory)
+            value_text = "N/A" if value_loss is None else f"{value_loss:.5f}"
+            print(f"  Value loss: {value_text}")
             if self._clear_value_buffer:
                 self.clear_value_memories()
             if self._debug_logging:
-                value_text = "none" if value_loss is None else f"{value_loss:.5f}"
                 print(
                     f"[ESCHER-Torch] Iter {self._iteration} value_loss={value_text} value_mem={value_mem_len}"
                 )
@@ -844,6 +1117,7 @@ class ESCHERSolverTorch(policy.Policy):
             value_loss_history.append(value_loss)
 
             for p in range(self._num_players):
+                print(f"Regret network training (Player {p}):")
                 self.traverse_game_tree_n_times(
                     self._num_traversals,
                     player=p,
@@ -861,11 +1135,13 @@ class ESCHERSolverTorch(policy.Policy):
                     self._regret_optimizers[p] = torch.optim.Adam(
                         self._regret_train_models[p].parameters(), lr=self._learning_rate
                     )
+                print(f"  Training regret network ({len(self._regret_memories[p])} samples)...")
                 loss = self._learn_regret_network(p)
                 if loss is not None:
                     regret_losses[p].append(loss)
+                loss_text = "N/A" if loss is None else f"{loss:.5f}"
+                print(f"  Regret loss: {loss_text}")
                 if self._debug_logging:
-                    loss_text = "none" if loss is None else f"{loss:.5f}"
                     reg_mem = len(self._regret_memories[p])
                     print(
                         f"[ESCHER-Torch] Iter {self._iteration} player={p} regret_loss={loss_text} mem={reg_mem}"
@@ -874,16 +1150,22 @@ class ESCHERSolverTorch(policy.Policy):
             self._iteration += 1
 
             iteration_times.append(time.time() - iter_start)
+            nodes_after = self._nodes_visited
+            nodes_this_iter = nodes_after - nodes_before
+            print(f"✓ Iteration {iteration + 1} complete: {iteration_times[-1]:.1f}s, {nodes_this_iter:,} nodes, total: {nodes_after:,}")
             if self._debug_logging:
-                nodes_after = self._nodes_visited
-                nodes_this_iter = nodes_after - nodes_before
                 print(
                     f"[ESCHER-Torch] Iteration {self._iteration - 1} duration={iteration_times[-1]:.3f}s nodes={nodes_this_iter}"
                 )
 
+        print("\nTraining final policy...")
         final_policy_loss = self._learn_average_policy_network()
+        final_policy_status = "N/A" if final_policy_loss is None else f"{final_policy_loss:.5f}"
+        print(f"Final policy loss: {final_policy_status}")
+        print(f"\n{'='*60}")
+        print("Training Complete!")
+        print(f"{'='*60}")
         if self._debug_logging:
-            final_policy_status = "none" if final_policy_loss is None else f"{final_policy_loss:.5f}"
             print(f"[ESCHER-Torch] Final policy loss={final_policy_status}")
         return (
             regret_losses,

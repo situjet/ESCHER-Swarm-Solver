@@ -11,15 +11,15 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import pyspiel
 
-GRID_SIZE = 16
+GRID_SIZE = 6
 BOTTOM_HALF_START = GRID_SIZE // 2
-NUM_TARGETS = 3
-NUM_AD_UNITS = 2
-NUM_ATTACKING_DRONES = 10
-NUM_INTERCEPTORS = 3
+NUM_TARGETS = 1
+NUM_AD_UNITS = 1
+NUM_ATTACKING_DRONES = 4
+NUM_INTERCEPTORS = 1
 TOT_CHOICES: Tuple[float, ...] = (0.0, 2.0, 4.0)
 TARGET_VALUE_OPTIONS: Tuple[float, ...] = (10.0, 20.0, 40.0)
-AD_COVERAGE_RADIUS = 5.0
+AD_COVERAGE_RADIUS = 2.0
 AD_STRIDE = 2
 TARGET_SPEED = 1.0
 INTERCEPTOR_SPEED_MULTIPLIER = 2.0
@@ -352,6 +352,10 @@ class SwarmDefenseState(pyspiel.State):
         new_state._phase = self._phase
         new_state._interceptor_steps = self._interceptor_steps
         new_state._next_ad_resolution_index = self._next_ad_resolution_index
+        new_state._next_interceptor_resolution_index = self._next_interceptor_resolution_index
+        new_state._next_ad_strike_index = self._next_ad_strike_index
+        new_state._next_target_strike_index = self._next_target_strike_index
+        new_state._damage_from_targets = self._damage_from_targets
         
         # Shallow copy lists of primitives/tuples
         new_state._history = self._history[:]
@@ -367,10 +371,15 @@ class SwarmDefenseState(pyspiel.State):
             for u in self._ad_units
         ]
         new_state._drone_plans = [
-            DronePlan(p.entry_row, p.entry_col, p.target_idx, p.tot_idx, p.destroyed_by, p.intercepts[:])
+            DronePlan(p.entry_row, p.entry_col, p.target_idx, p.tot_idx, p.destroyed_by, 
+                     p.intercepts[:], p.interceptor_hit, p.interceptor_time, p.strike_success, p.damage_inflicted)
             for p in self._drone_plans
         ]
         new_state._pending_ad_targets = self._pending_ad_targets[:]
+        new_state._pending_interceptor_hits = self._pending_interceptor_hits[:]
+        new_state._pending_ad_strikes = self._pending_ad_strikes[:]
+        new_state._pending_target_strikes = self._pending_target_strikes[:]
+        new_state._interceptor_engaged = self._interceptor_engaged.copy()
         
         return new_state
 
