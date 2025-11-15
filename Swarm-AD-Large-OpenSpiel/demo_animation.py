@@ -16,7 +16,6 @@ import policy_transfer
 from policy_transfer import build_blueprint_from_small_snapshot, rollout_blueprint_episode
 from swarm_defense_large_game import (
     AD_COVERAGE_RADIUS,
-    AD_FOV_DEGREES,
     ARENA_HEIGHT,
     ARENA_WIDTH,
     LARGE_TOT_CHOICES,
@@ -30,6 +29,16 @@ AD_KILL_COLOR = "#FF3B30"
 AD_KILL_EDGE = "black"
 INTERCEPTOR_KILL_COLOR = "#0bc5ea"
 AD_TARGET_KILL_COLOR = "#2E8B57"
+AD_ROTATION_ARROW_COLOR = "#1f4c94"
+
+
+def _normalize_angle(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def _interpolate_angle(start: float, end: float, ratio: float) -> float:
+    delta = _normalize_angle(end - start)
+    return start + delta * ratio
 
 
 @dataclass
@@ -219,19 +228,21 @@ def _max_time(series: Sequence[DroneSeries]) -> float:
     return max_t + 2.0
 
 
-def _orientation_at(base_orientation: float, events: Sequence[Tuple[float, float, float, float]], t: float) -> float:
+def _orientation_from_events(
+    base_orientation: float,
+    events: Sequence[Tuple[float, float, float, float]],
+    t: float,
+) -> float:
     orientation = base_orientation
-    for start, end, from_angle, to_angle in events:
-        if t < start:
+    for start_time, end_time, start_dir, end_dir in events:
+        if t < start_time:
             break
-        if start == end:
-            orientation = to_angle
-            continue
-        if start <= t <= end:
-            ratio = (t - start) / (end - start)
-            orientation = from_angle + (to_angle - from_angle) * ratio
-            return orientation
-        orientation = to_angle
+        if end_time > start_time and start_time <= t <= end_time:
+            span = max(end_time - start_time, 1e-6)
+            ratio = min(max((t - start_time) / span, 0.0), 1.0)
+            return _interpolate_angle(start_dir, end_dir, ratio)
+        if t >= end_time:
+            orientation = end_dir
     return orientation
 
 
@@ -255,19 +266,28 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
         ax.scatter(target.col, target.row, s=220, color="tab:green", marker="o")
         ax.text(target.col + 0.3, target.row, f"T{idx}\nV={target.value:.0f}")
 
-    wedges: List[patches.Wedge] = []
+    arrow_length = AD_COVERAGE_RADIUS * 0.95
+    ad_arrows = []
     for unit in ad_units:
         row, col = unit["position"]
-        wedge = patches.Wedge(
-            center=(col, row),
-            r=AD_COVERAGE_RADIUS,
-            theta1=0,
-            theta2=0,
-            color="tab:blue",
-            alpha=0.15,
+        base_orientation = float(unit.get("orientation", math.pi / 2))
+        events: Sequence[Tuple[float, float, float, float]] = unit.get("orientation_events", ())
+        arrow = patches.FancyArrowPatch(
+            (col, row),
+            (col, row),
+            arrowstyle="->",
+            color=AD_ROTATION_ARROW_COLOR,
+            linewidth=1.6,
+            mutation_scale=12,
         )
-        ax.add_patch(wedge)
-        wedges.append(wedge)
+        ax.add_patch(arrow)
+        ad_arrows.append({
+            "arrow": arrow,
+            "col": col,
+            "row": row,
+            "base": base_orientation,
+            "events": events,
+        })
         ax.scatter(col, row, s=220, marker="^", color="tab:blue")
 
     drone_markers = [ax.scatter(ser.entry[1], ser.entry[0], color=ser.color, s=50) for ser in series]
@@ -337,16 +357,12 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
                     marker.set_alpha(1.0)
                 else:
                     marker.set_alpha(0.0)
-        for ad_idx, wedge in enumerate(wedges):
-            unit = ad_units[ad_idx]
-            events = unit.get("rotation_events", ())
-            orientation = _orientation_at(float(unit.get("orientation", math.pi / 2)), events, current_time)
-            half_fov = math.radians(AD_FOV_DEGREES) / 2
-            theta1 = math.degrees(orientation - half_fov)
-            theta2 = math.degrees(orientation + half_fov)
-            wedge.theta1 = theta1
-            wedge.theta2 = theta2
-        artists = drone_markers + path_lines + wedges + [time_text]
+        for data in ad_arrows:
+            orientation = _orientation_from_events(data["base"], data["events"], current_time)
+            end_col = data["col"] + arrow_length * math.cos(orientation)
+            end_row = data["row"] + arrow_length * math.sin(orientation)
+            data["arrow"].set_positions((data["col"], data["row"]), (end_col, end_row))
+        artists = drone_markers + path_lines + [data["arrow"] for data in ad_arrows] + [time_text]
         artists.extend(marker for marker in kill_markers if marker is not None)
         return artists
 

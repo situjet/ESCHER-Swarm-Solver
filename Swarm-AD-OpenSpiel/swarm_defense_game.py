@@ -788,6 +788,8 @@ class SwarmDefenseState(pyspiel.State):
             arrival_time = _arrival_time_to_point(plan, destination)
             if intercept_time >= arrival_time:
                 continue
+            if intercept_time < self._ad_ready_time[ad_idx]:
+                continue
             effective_exposure = max(exposure, AD_MIN_EFFECTIVE_EXPOSURE)
             probability = 1.0 - math.exp(-AD_KILL_RATE * effective_exposure)
             probability = max(0.0, min(1.0, probability))
@@ -835,10 +837,16 @@ class SwarmDefenseState(pyspiel.State):
             plan.destroyed_by = f"ad:{intercept.ad_idx}"
             plan.intercepts.append((intercept.ad_idx, intercept.hit_point, intercept.intercept_time))
             ad_unit.intercept_log.append((intercept.drone_idx, intercept.hit_point, intercept.intercept_time))
+        self._ad_ready_time[intercept.ad_idx] = max(
+            self._ad_ready_time[intercept.ad_idx],
+            intercept.intercept_time + AD_REENGAGE_DELAY,
+        )
         self._next_ad_resolution_index += 1
         if self._next_ad_resolution_index >= len(self._pending_ad_targets):
             self._pending_ad_targets.clear()
             self._next_ad_resolution_index = 0
+            if self._start_ad_resolution():
+                return
             self._start_drone_ad_strike_resolution()
 
     def _finalize_returns(self) -> None:

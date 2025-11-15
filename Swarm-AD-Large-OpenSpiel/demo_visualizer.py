@@ -16,7 +16,6 @@ import policy_transfer
 from policy_transfer import build_blueprint_from_small_snapshot, rollout_blueprint_episode
 from swarm_defense_large_game import (
     AD_COVERAGE_RADIUS,
-    AD_FOV_DEGREES,
     ARENA_HEIGHT,
     ARENA_WIDTH,
     LARGE_TOT_CHOICES,
@@ -38,7 +37,6 @@ AD_KILL_EDGE = "black"
 AD_KILL_LINK = "#8C1B13"
 INTERCEPTOR_KILL_COLOR = "#0bc5ea"
 AD_TARGET_KILL_COLOR = "#2E8B57"
-AD_ROTATION_ARC_COLOR = "#144a74"
 AD_ROTATION_ARROW_COLOR = "#1f4c94"
 
 
@@ -134,59 +132,6 @@ def _kill_event(drone: Dict[str, object], ad_positions: Dict[int, Tuple[float, f
         }
     return None
 
-
-def _rad_to_deg(angle: float) -> float:
-    return math.degrees(angle)
-
-
-def _normalize_arc(theta1: float, theta2: float) -> Tuple[float, float]:
-    while theta2 < theta1:
-        theta2 += 360.0
-    return theta1, theta2
-
-
-def _draw_rotation_history(
-    ax: plt.Axes,
-    row: float,
-    col: float,
-    rotation_events: Sequence[Tuple[float, float, float, float]],
-) -> None:
-    if not rotation_events:
-        return
-    arc_diameter = AD_COVERAGE_RADIUS * 2.2
-    label_radius = AD_COVERAGE_RADIUS + 0.45
-    for start_time, end_time, start_angle, end_angle in rotation_events:
-        theta1 = _rad_to_deg(start_angle)
-        theta2 = _rad_to_deg(end_angle)
-        theta1, theta2 = _normalize_arc(theta1, theta2)
-        arc = patches.Arc(
-            (col, row),
-            width=arc_diameter,
-            height=arc_diameter,
-            angle=0,
-            theta1=theta1,
-            theta2=theta2,
-            linestyle="--",
-            linewidth=1.05,
-            color=AD_ROTATION_ARC_COLOR,
-            alpha=0.85,
-            zorder=1,
-        )
-        ax.add_patch(arc)
-        mid_deg = (theta1 + theta2) / 2.0
-        mid_rad = math.radians(mid_deg)
-        label_x = col + label_radius * math.cos(mid_rad)
-        label_y = row + label_radius * math.sin(mid_rad)
-        ax.text(
-            label_x,
-            label_y,
-            f"t={end_time:.1f}",
-            fontsize=6,
-            color=AD_ROTATION_ARC_COLOR,
-            ha="center",
-            va="center",
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.65},
-        )
 
 
 def _trim_samples(
@@ -318,32 +263,17 @@ def _draw_kill_marker(
 def _draw_ad_unit(ax, unit: Dict[str, object]) -> None:
     row, col = unit["position"]
     alive = bool(unit.get("alive", True))
-    orientation = float(unit.get("orientation", 0.0))
+    orientation = float(unit.get("orientation", math.pi / 2))
     color = "tab:blue" if alive else "tab:gray"
-    rotation_events: Sequence[Tuple[float, float, float, float]] = unit.get("rotation_events", ())
-    _draw_rotation_history(ax, row, col, rotation_events)
     ax.scatter(col, row, s=220, marker="^" if alive else "v", color=color, zorder=5)
-    theta_center = _rad_to_deg(orientation)
-    half_fov = AD_FOV_DEGREES / 2
-    wedge = patches.Wedge(
-        center=(col, row),
-        r=AD_COVERAGE_RADIUS,
-        theta1=theta_center - half_fov,
-        theta2=theta_center + half_fov,
-        alpha=0.18,
-        color="tab:blue",
-        zorder=2,
-    )
-    ax.add_patch(wedge)
     arrow_length = AD_COVERAGE_RADIUS * 0.95
-    arrow_x = col + arrow_length * math.cos(math.radians(theta_center))
-    arrow_y = row + arrow_length * math.sin(math.radians(theta_center))
-    ax.plot(
-        [col, arrow_x],
-        [row, arrow_y],
-        color=AD_ROTATION_ARROW_COLOR,
-        linewidth=1.4,
-        alpha=0.9,
+    arrow_x = col + arrow_length * math.cos(orientation)
+    arrow_y = row + arrow_length * math.sin(orientation)
+    ax.annotate(
+        "",
+        xy=(arrow_x, arrow_y),
+        xytext=(col, row),
+        arrowprops={"color": AD_ROTATION_ARROW_COLOR, "linewidth": 1.6, "arrowstyle": "->"},
         zorder=4,
     )
 
@@ -415,7 +345,6 @@ def render_snapshot(state: SwarmDefenseLargeState, output_path: Path) -> None:
 
     legend_elements = [
         patches.Patch(facecolor="tab:green", edgecolor="black", label="Targets"),
-        patches.Patch(facecolor="tab:blue", alpha=0.2, label="AD FOV"),
         mlines.Line2D([], [], color="black", marker="o", markerfacecolor="none", linestyle="None", label="Survivor dest"),
         mlines.Line2D([], [], color=AD_KILL_COLOR, marker="X", linestyle="None", label="AD intercept"),
         mlines.Line2D([], [], color=INTERCEPTOR_KILL_COLOR, marker="*", markeredgecolor="black", linestyle="None", label="Interceptor kill"),
@@ -424,10 +353,8 @@ def render_snapshot(state: SwarmDefenseLargeState, output_path: Path) -> None:
     ax.legend(handles=legend_elements, loc="upper right")
     allocation_lines = []
     for idx, unit in enumerate(ad_units):
-        events = unit.get("rotation_events", ())
-        engagements = len(events)
         kills = len(unit.get("intercept_log", ()))
-        allocation_lines.append(f"AD{idx}: {kills}/{engagements if engagements else 0} kills/alloc")
+        allocation_lines.append(f"AD{idx}: {kills} kills")
     summary_text = [
         f"AD intercepts: {ad_kills}",
         f"AD-target strikes: {ad_attrit}",

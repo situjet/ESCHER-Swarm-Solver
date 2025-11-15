@@ -55,7 +55,6 @@ AD_COVERAGE_RADIUS = 5.5
 AD_KILL_RATE = 1.6
 AD_MIN_EFFECTIVE_EXPOSURE = 0.75
 AD_FOV_DEGREES = 120.0
-AD_ROTATION_RATE_DEG_PER_SEC = 35.0
 AD_ROTATION_TOLERANCE = 4.0
 INTERCEPTOR_LAUNCH_ROW = ARENA_HEIGHT + 2.0
 INTERCEPTOR_KILL_PROB = 0.95
@@ -161,7 +160,6 @@ class ADIntercept:
     probability: float
     hit_point: Tuple[float, float]
     intercept_time: float
-    rotation_delay: float
     direction: float
 
 
@@ -185,14 +183,6 @@ class DroneTargetStrike:
     drone_idx: int
     target_idx: int
     probability: float = DRONE_VS_TARGET_KILL_PROB
-
-
-@dataclass
-class RotationEvent:
-    start_time: float
-    end_time: float
-    start_angle: float
-    end_angle: float
 
 
 class Phase(Enum):
@@ -283,8 +273,7 @@ class SwarmDefenseLargeState(pyspiel.State):
         self._damage_from_targets = 0.0
         self._returns = [0.0, 0.0]
         self._rng = random.Random()
-        self._ad_rotation_events: Dict[int, List[RotationEvent]] = {}
-        self._ad_orientation_projection: Dict[int, float] = {}
+        self._ad_orientation_events: Dict[int, List[Tuple[float, float]]] = {}
         self._tot_anchor = None
 
     def phase(self) -> Phase:
@@ -302,15 +291,7 @@ class SwarmDefenseLargeState(pyspiel.State):
                     "destroyed_by": unit.destroyed_by,
                     "orientation": unit.orientation,
                     "intercept_log": tuple(unit.intercept_log),
-                    "rotation_events": tuple(
-                        (
-                            event.start_time,
-                            event.end_time,
-                            event.start_angle,
-                            event.end_angle,
-                        )
-                        for event in self._ad_rotation_events.get(idx, [])
-                    ),
+                    "orientation_events": tuple(self._ad_orientation_events.get(idx, [])),
                 }
                 for idx, unit in enumerate(self._ad_units)
             ),
@@ -627,7 +608,6 @@ class SwarmDefenseLargeState(pyspiel.State):
             if intercept is not None:
                 engaged.add(intercept.drone_idx)
                 self._pending_ad_targets.append(intercept)
-                self._register_rotation_event(intercept)
         if not self._pending_ad_targets:
             self._start_drone_ad_strike_resolution()
         else:
@@ -667,8 +647,7 @@ class SwarmDefenseLargeState(pyspiel.State):
     def _select_drone_for_ad(self, ad_idx: int, engaged: set[int]) -> Optional[ADIntercept]:
         ad_unit = self._ad_units[ad_idx]
         position = (ad_unit.row, ad_unit.col)
-        current_orientation = self._ad_orientation_projection.get(ad_idx, ad_unit.orientation)
-        best_sort: Optional[Tuple[float, float, float, int]] = None
+        best_sort: Optional[Tuple[float, float, int]] = None
         best_payload: Optional[ADIntercept] = None
         for idx, plan in enumerate(self._drone_plans):
             if plan.destroyed_by is not None or idx in engaged:
@@ -679,17 +658,15 @@ class SwarmDefenseLargeState(pyspiel.State):
             intercept_time = self._arrival_time(plan, entry_distance)
             arrival_time = self._arrival_time(plan, plan.total_distance)
             direction = _angle_between(position, entry_point)
-            rotation_delay = self._rotation_delay(current_orientation, direction)
-            if intercept_time + rotation_delay >= arrival_time:
+            if intercept_time >= arrival_time:
                 continue
             effective_exposure = max(exposure, AD_MIN_EFFECTIVE_EXPOSURE)
             probability = 1.0 - math.exp(-AD_KILL_RATE * effective_exposure)
-            if rotation_delay > 0:
-                probability *= max(0.0, 1.0 - rotation_delay / AD_ROTATION_TOLERANCE)
             probability = max(0.0, min(1.0, probability))
             if probability <= 0.0:
                 continue
-            sort_key = (intercept_time, rotation_delay, -exposure, idx)
+            distance_to_entry = math.dist(position, entry_point)
+            sort_key = (distance_to_entry, intercept_time, idx)
             if best_sort is None or sort_key < best_sort:
                 best_sort = sort_key
                 best_payload = ADIntercept(
@@ -699,9 +676,11 @@ class SwarmDefenseLargeState(pyspiel.State):
                     probability=probability,
                     hit_point=entry_point,
                     intercept_time=intercept_time,
-                    rotation_delay=rotation_delay,
                     direction=direction,
                 )
+        if best_payload is not None:
+            self._ad_units[ad_idx].orientation = best_payload.direction
+            self._record_orientation_event(ad_idx, best_payload.intercept_time, best_payload.direction)
         return best_payload
 
     def _path_exposure_stats(
@@ -727,24 +706,6 @@ class SwarmDefenseLargeState(pyspiel.State):
             prev_inside = inside
         return exposure, entry_point, entry_distance
 
-    def _register_rotation_event(self, intercept: ADIntercept) -> None:
-        ad_idx = intercept.ad_idx
-        start_angle = self._ad_orientation_projection.get(ad_idx, self._ad_units[ad_idx].orientation)
-        start_time = max(0.0, intercept.intercept_time - intercept.rotation_delay)
-        end_time = intercept.intercept_time
-        event = RotationEvent(start_time, end_time, start_angle, intercept.direction)
-        self._ad_rotation_events.setdefault(ad_idx, []).append(event)
-        self._ad_orientation_projection[ad_idx] = intercept.direction
-
-    def _rotation_delay(self, current: float, target: float) -> float:
-        half_fov = _degrees_to_radians(AD_FOV_DEGREES) / 2
-        diff = abs(_normalize_angle(target - current))
-        if diff <= half_fov:
-            return 0.0
-        extra = diff - half_fov
-        rate = _degrees_to_radians(AD_ROTATION_RATE_DEG_PER_SEC)
-        return extra / rate
-
     def _compute_interceptor_intercept(
         self, plan: DronePlan, destination: Tuple[float, float]
     ) -> Optional[Tuple[float, Tuple[float, float]]]:
@@ -768,6 +729,10 @@ class SwarmDefenseLargeState(pyspiel.State):
         ad_unit = self._ad_units[ad_idx]
         return (ad_unit.row, ad_unit.col)
 
+    def _record_orientation_event(self, ad_idx: int, intercept_time: float, direction: float) -> None:
+        events = self._ad_orientation_events.setdefault(ad_idx, [])
+        events.append((intercept_time, direction))
+
     def _apply_ad_resolution(self, action: int) -> None:
         if not self._pending_ad_targets:
             raise ValueError("No engagements pending")
@@ -776,12 +741,11 @@ class SwarmDefenseLargeState(pyspiel.State):
         ad_unit = self._ad_units[intercept.ad_idx]
         success = action == AD_RESOLVE_ACTION_BASE + 1
         arrival_time = self._arrival_time(plan, plan.total_distance)
-        if success and plan.destroyed_by is None and intercept.intercept_time + intercept.rotation_delay < arrival_time:
+        if success and plan.destroyed_by is None and intercept.intercept_time < arrival_time:
             plan.destroyed_by = f"ad:{intercept.ad_idx}"
             plan.intercepts.append((intercept.ad_idx, intercept.hit_point, intercept.intercept_time))
             ad_unit.intercept_log.append((intercept.drone_idx, intercept.hit_point, intercept.intercept_time))
         ad_unit.orientation = intercept.direction
-        self._ad_orientation_projection[intercept.ad_idx] = intercept.direction
         self._next_ad_resolution_index += 1
         if self._next_ad_resolution_index >= len(self._pending_ad_targets):
             self._pending_ad_targets.clear()
