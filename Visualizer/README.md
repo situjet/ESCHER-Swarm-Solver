@@ -23,6 +23,9 @@ swarm-visualizer --iterations 1 --cot-endpoint udp://127.0.0.1:6969 --dry-run
 
 - Remove `--dry-run` to stream CoT to WinTAK directly (ensure your TAK client listens on the same UDP endpoint).
 - Use `--export-file cot_log.xml` to persist the feed for later ingestion.
+- `--cot-endpoint` must point to a TAK transport such as `udp://`, `udp+wo://`, `tcp://`, or `tls://`; HTTP(S) URLs are not valid for CoT streaming.
+- Need a quick sanity check before running the full simulator? Use `python scripts/push_test_cot.py --cot-endpoint udp://127.0.0.1:6969 --uid TEST --callsign TEST` to fire a single CoT icon so you can confirm WinTAK is listening.
+- Want to see multiple symbology examples at once? Run `python scripts/push_test_cot.py --cot-endpoint udp://127.0.0.1:6969 --mode sample-pack` to publish a curated set of hostile drones, blue-force interceptors, air-defense units, targets, and kill markers centered on the National Mall. Each icon prints its precise lat/lon as it transmits so you can pan the WinTAK map to the Washington Monument, White House, Capitol, Pentagon, and Joint Base Anacostia-Bolling with confidence.
 
 ## Project Layout
 
@@ -49,6 +52,7 @@ swarm-visualizer --iterations 1 --cot-endpoint udp://127.0.0.1:6969 --dry-run
 1. Launch WinTAK and ensure it is listening for UDP CoT traffic (Settings → Network → CoT → UDP Listener). Default: `udp://127.0.0.1:6969`.
 2. Run `swarm-visualizer --iterations 5 --cot-endpoint udp://127.0.0.1:6969`.
 3. Observe attacker, interceptor, and AD symbology appear on the WinTAK map. Each snapshot encodes the full board state with timestamps that honor the TOT offsets.
+4. (Optional) Use the sample icon pack command above to keep a baseline set of representative symbols on the map while you iterate on TAK network settings.
 
 ## Advanced Options
 
@@ -58,6 +62,8 @@ swarm-visualizer --iterations 1 --cot-endpoint udp://127.0.0.1:6969 --dry-run
 - `--export-file cot_log.xml` – Archive CoT stream for offline analysis.
 - `--iterations 10` – Chain multiple simulated matches.
 - `--origin-lat / --origin-lon / --altitude-ft` – Reposition the grid anywhere on earth. Defaults place the scenario over the Washington, DC National Mall so it is easy to spot from WinTAK.
+    - If you are targeting a TAK server over TLS, use a `tls://host:port` URL. Do **not** supply `https://` or `http://`—those speak the MARTI REST API rather than the CoT transport and will be rejected by the CLI.
+    - To validate network reachability independently of the simulator, leverage `scripts/push_test_cot.py` to drip one or more test events at your endpoint and watch them appear instantly in WinTAK.
 
 ### Washington, DC example (WSL → WinTAK)
 

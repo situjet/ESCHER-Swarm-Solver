@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -37,6 +38,8 @@ AD_KILL_EDGE = "black"
 AD_KILL_LINK = "#8C1B13"
 INTERCEPTOR_KILL_COLOR = "#0bc5ea"
 AD_TARGET_KILL_COLOR = "#2E8B57"
+AD_ROTATION_ARC_COLOR = "#144a74"
+AD_ROTATION_ARROW_COLOR = "#1f4c94"
 
 
 def _sample_chance_action(state: pyspiel.State, rng: random.Random) -> int:
@@ -86,12 +89,12 @@ def _tot_color(tot: float) -> str:
 
 def _kill_event(drone: Dict[str, object], ad_positions: Dict[int, Tuple[float, float]]) -> Optional[Dict[str, object]]:
     destroyed = str(drone.get("destroyed_by") or "")
-    tot = float(drone.get("tot") or 0.0)
+    hold = float(drone.get("hold_time") or 0.0)
     intercepts: Sequence[Tuple[int, Tuple[float, float], float]] = drone.get("intercepts", ())
     if destroyed.startswith("ad:") and intercepts:
         ad_idx, hit_point, intercept_time = intercepts[0]
         kill_time = float(intercept_time)
-        kill_distance = max(0.0, (kill_time - tot) * DRONE_SPEED)
+        kill_distance = max(0.0, (kill_time - hold) * DRONE_SPEED)
         return {
             "type": "ad",
             "point": tuple(hit_point),
@@ -104,7 +107,7 @@ def _kill_event(drone: Dict[str, object], ad_positions: Dict[int, Tuple[float, f
         kill_time = drone.get("interceptor_time")
         if hit is not None and kill_time is not None:
             kill_time = float(kill_time)
-            kill_distance = max(0.0, (kill_time - tot) * DRONE_SPEED)
+            kill_distance = max(0.0, (kill_time - hold) * DRONE_SPEED)
             return {
                 "type": "interceptor",
                 "point": tuple(hit),
@@ -121,7 +124,7 @@ def _kill_event(drone: Dict[str, object], ad_positions: Dict[int, Tuple[float, f
         entry = drone.get("entry")
         kill_point = tuple(ad_point or destination or entry)
         total_distance = float(drone.get("total_distance") or 0.0)
-        kill_time = tot + total_distance / DRONE_SPEED
+        kill_time = hold + total_distance / DRONE_SPEED
         return {
             "type": "ad_target",
             "point": kill_point,
@@ -130,6 +133,60 @@ def _kill_event(drone: Dict[str, object], ad_positions: Dict[int, Tuple[float, f
             "ad_idx": ad_idx,
         }
     return None
+
+
+def _rad_to_deg(angle: float) -> float:
+    return math.degrees(angle)
+
+
+def _normalize_arc(theta1: float, theta2: float) -> Tuple[float, float]:
+    while theta2 < theta1:
+        theta2 += 360.0
+    return theta1, theta2
+
+
+def _draw_rotation_history(
+    ax: plt.Axes,
+    row: float,
+    col: float,
+    rotation_events: Sequence[Tuple[float, float, float, float]],
+) -> None:
+    if not rotation_events:
+        return
+    arc_diameter = AD_COVERAGE_RADIUS * 2.2
+    label_radius = AD_COVERAGE_RADIUS + 0.45
+    for start_time, end_time, start_angle, end_angle in rotation_events:
+        theta1 = _rad_to_deg(start_angle)
+        theta2 = _rad_to_deg(end_angle)
+        theta1, theta2 = _normalize_arc(theta1, theta2)
+        arc = patches.Arc(
+            (col, row),
+            width=arc_diameter,
+            height=arc_diameter,
+            angle=0,
+            theta1=theta1,
+            theta2=theta2,
+            linestyle="--",
+            linewidth=1.05,
+            color=AD_ROTATION_ARC_COLOR,
+            alpha=0.85,
+            zorder=1,
+        )
+        ax.add_patch(arc)
+        mid_deg = (theta1 + theta2) / 2.0
+        mid_rad = math.radians(mid_deg)
+        label_x = col + label_radius * math.cos(mid_rad)
+        label_y = row + label_radius * math.sin(mid_rad)
+        ax.text(
+            label_x,
+            label_y,
+            f"t={end_time:.1f}",
+            fontsize=6,
+            color=AD_ROTATION_ARC_COLOR,
+            ha="center",
+            va="center",
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.65},
+        )
 
 
 def _trim_samples(
@@ -263,16 +320,32 @@ def _draw_ad_unit(ax, unit: Dict[str, object]) -> None:
     alive = bool(unit.get("alive", True))
     orientation = float(unit.get("orientation", 0.0))
     color = "tab:blue" if alive else "tab:gray"
-    ax.scatter(col, row, s=220, marker="^" if alive else "v", color=color)
+    rotation_events: Sequence[Tuple[float, float, float, float]] = unit.get("rotation_events", ())
+    _draw_rotation_history(ax, row, col, rotation_events)
+    ax.scatter(col, row, s=220, marker="^" if alive else "v", color=color, zorder=5)
+    theta_center = _rad_to_deg(orientation)
+    half_fov = AD_FOV_DEGREES / 2
     wedge = patches.Wedge(
         center=(col, row),
         r=AD_COVERAGE_RADIUS,
-        theta1=(orientation - AD_FOV_DEGREES / 2) * 180 / 3.14159,
-        theta2=(orientation + AD_FOV_DEGREES / 2) * 180 / 3.14159,
-        alpha=0.15,
+        theta1=theta_center - half_fov,
+        theta2=theta_center + half_fov,
+        alpha=0.18,
         color="tab:blue",
+        zorder=2,
     )
     ax.add_patch(wedge)
+    arrow_length = AD_COVERAGE_RADIUS * 0.95
+    arrow_x = col + arrow_length * math.cos(math.radians(theta_center))
+    arrow_y = row + arrow_length * math.sin(math.radians(theta_center))
+    ax.plot(
+        [col, arrow_x],
+        [row, arrow_y],
+        color=AD_ROTATION_ARROW_COLOR,
+        linewidth=1.4,
+        alpha=0.9,
+        zorder=4,
+    )
 
 
 def render_snapshot(state: SwarmDefenseLargeState, output_path: Path) -> None:
@@ -304,6 +377,8 @@ def render_snapshot(state: SwarmDefenseLargeState, output_path: Path) -> None:
     for idx, drone in enumerate(drones):
         entry_row, entry_col = drone["entry"]
         tot = float(drone.get("tot") or 0.0)
+        hold = float(drone.get("hold_time") or 0.0)
+        arrival_time = float(drone.get("arrival_time") or (hold + float(drone.get("total_distance") or 0.0) / DRONE_SPEED))
         color = _tot_color(tot)
         kill = _kill_event(drone, ad_positions)
         kill_distance = kill.get("distance") if isinstance(kill, dict) else None
@@ -334,7 +409,7 @@ def render_snapshot(state: SwarmDefenseLargeState, output_path: Path) -> None:
                 linewidths=1.4,
                 zorder=4,
             )
-            ax.text(dest_col + 0.2, dest_row - 0.2, f"ToT={tot:.1f}", color=color, fontsize=7)
+            ax.text(dest_col + 0.2, dest_row - 0.2, f"ToT={arrival_time:.1f}s", color=color, fontsize=7)
         else:
             _draw_kill_marker(ax, kill, ad_positions)
 
@@ -347,13 +422,28 @@ def render_snapshot(state: SwarmDefenseLargeState, output_path: Path) -> None:
         mlines.Line2D([], [], color=AD_TARGET_KILL_COLOR, marker="D", markeredgecolor="black", linestyle="None", label="AD-target strike"),
     ]
     ax.legend(handles=legend_elements, loc="upper right")
+    allocation_lines = []
+    for idx, unit in enumerate(ad_units):
+        events = unit.get("rotation_events", ())
+        engagements = len(events)
+        kills = len(unit.get("intercept_log", ()))
+        allocation_lines.append(f"AD{idx}: {kills}/{engagements if engagements else 0} kills/alloc")
+    summary_text = [
+        f"AD intercepts: {ad_kills}",
+        f"AD-target strikes: {ad_attrit}",
+        f"Interceptor kills: {interceptor_kills}",
+        f"Survivors: {survivors}",
+        "",
+        "AD allocation:",
+    ]
+    summary_text.extend(f"  {line}" for line in allocation_lines)
     ax.text(
         0.01,
         0.04,
-        f"AD intercepts: {ad_kills}\nAD-target strikes: {ad_attrit}\nInterceptor kills: {interceptor_kills}\nSurvivors: {survivors}",
+        "\n".join(summary_text),
         transform=ax.transAxes,
         fontsize=9,
-        bbox={"facecolor": "white", "alpha": 0.75},
+        bbox={"facecolor": "white", "alpha": 0.78},
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -53,10 +53,15 @@ ENTRY_POINTS: List[Tuple[float, float]] = [(0.0, lane + 0.5) for lane in range(E
 LARGE_TOT_CHOICES: Tuple[float, ...] = (0.0, 1.5, 3.0, 4.5)
 AD_COVERAGE_RADIUS = 5.5
 AD_KILL_RATE = 1.6
+AD_MIN_EFFECTIVE_EXPOSURE = 0.75
 AD_FOV_DEGREES = 120.0
 AD_ROTATION_RATE_DEG_PER_SEC = 35.0
 AD_ROTATION_TOLERANCE = 4.0
 INTERCEPTOR_LAUNCH_ROW = ARENA_HEIGHT + 2.0
+INTERCEPTOR_KILL_PROB = 0.95
+DRONE_VS_AD_KILL_PROB = 0.8
+DRONE_VS_TARGET_KILL_PROB = 0.7
+RRT_TIME_LIMIT_SEC = 0.035
 
 TARGET_CANDIDATE_CELLS: List[Tuple[float, float]] = [
     (row, col)
@@ -138,6 +143,10 @@ class DronePlan:
     waypoints: List[Tuple[float, float]] = field(default_factory=list)
     path_samples: List[Tuple[float, float, float]] = field(default_factory=list)
     total_distance: float = 0.0
+    hold_time: float = 0.0
+    arrival_time: float = 0.0
+    strike_success: Optional[bool] = None
+    damage_inflicted: float = 0.0
 
     @property
     def entry_point(self) -> Tuple[float, float]:
@@ -157,6 +166,28 @@ class ADIntercept:
 
 
 @dataclass
+class InterceptorEngagement:
+    drone_idx: int
+    hit_point: Tuple[float, float]
+    intercept_time: float
+    probability: float = INTERCEPTOR_KILL_PROB
+
+
+@dataclass
+class DroneADStrike:
+    ad_idx: int
+    drone_idx: int
+    probability: float = DRONE_VS_AD_KILL_PROB
+
+
+@dataclass
+class DroneTargetStrike:
+    drone_idx: int
+    target_idx: int
+    probability: float = DRONE_VS_TARGET_KILL_PROB
+
+
+@dataclass
 class RotationEvent:
     start_time: float
     end_time: float
@@ -170,7 +201,10 @@ class Phase(Enum):
     AD_PLACEMENT = auto()
     SWARM_ASSIGNMENT = auto()
     INTERCEPT_ASSIGNMENT = auto()
+    INTERCEPT_RESOLUTION = auto()
     AD_RESOLUTION = auto()
+    DRONE_AD_STRIKE_RESOLUTION = auto()
+    TARGET_DAMAGE_RESOLUTION = auto()
     TERMINAL = auto()
 
 
@@ -232,16 +266,26 @@ class SwarmDefenseLargeState(pyspiel.State):
         self._phase = Phase.TARGET_POSITIONS
         self._history: List[int] = []
         self._targets: List[TargetCluster] = []
+        self._target_destroyed: List[bool] = []
         self._target_positions: List[Tuple[float, float]] = []
         self._ad_units: List[ADUnit] = []
         self._drone_plans: List[DronePlan] = []
         self._interceptor_steps = 0
+        self._pending_interceptor_hits: List[InterceptorEngagement] = []
+        self._next_interceptor_resolution_index = 0
+        self._interceptor_engaged: set[int] = set()
         self._pending_ad_targets: List[ADIntercept] = []
         self._next_ad_resolution_index = 0
+        self._pending_ad_strikes: List[DroneADStrike] = []
+        self._next_ad_strike_index = 0
+        self._pending_target_strikes: List[DroneTargetStrike] = []
+        self._next_target_strike_index = 0
+        self._damage_from_targets = 0.0
         self._returns = [0.0, 0.0]
         self._rng = random.Random()
         self._ad_rotation_events: Dict[int, List[RotationEvent]] = {}
         self._ad_orientation_projection: Dict[int, float] = {}
+        self._tot_anchor = None
 
     def phase(self) -> Phase:
         return self._phase
@@ -250,12 +294,13 @@ class SwarmDefenseLargeState(pyspiel.State):
         return {
             "phase": self._phase.name,
             "targets": tuple(self._targets),
+            "target_destroyed": tuple(self._target_destroyed),
             "ad_units": tuple(
                 {
                     "position": (unit.row, unit.col),
                     "alive": unit.alive,
-                    "orientation": unit.orientation,
                     "destroyed_by": unit.destroyed_by,
+                    "orientation": unit.orientation,
                     "intercept_log": tuple(unit.intercept_log),
                     "rotation_events": tuple(
                         (
@@ -273,16 +318,26 @@ class SwarmDefenseLargeState(pyspiel.State):
                 {
                     "entry": plan.entry_point,
                     "target_idx": plan.target_idx,
+                    "destination": self._drone_destination(plan),
+                    "target_value": (
+                        self._targets[plan.target_idx].value
+                        if plan.target_idx < len(self._targets)
+                        else None
+                    ),
                     "tot_idx": plan.tot_idx,
                     "tot": LARGE_TOT_CHOICES[plan.tot_idx],
+                    "hold_time": plan.hold_time,
+                    "arrival_time": plan.arrival_time,
+                    "blueprint_idx": plan.blueprint_idx,
                     "blueprint": MIDPOINT_STRATEGIES[plan.blueprint_idx],
-                    "destination": self._drone_destination(plan),
                     "path": tuple(plan.waypoints),
                     "path_samples": tuple(plan.path_samples),
                     "destroyed_by": plan.destroyed_by,
                     "intercepts": tuple(plan.intercepts),
                     "interceptor_hit": plan.interceptor_hit,
                     "interceptor_time": plan.interceptor_time,
+                    "strike_success": plan.strike_success,
+                    "damage_inflicted": plan.damage_inflicted,
                     "total_distance": plan.total_distance,
                 }
                 for plan in self._drone_plans
@@ -293,7 +348,14 @@ class SwarmDefenseLargeState(pyspiel.State):
     def current_player(self) -> int:
         if self._phase == Phase.TERMINAL:
             return pyspiel.PlayerId.TERMINAL
-        if self._phase in (Phase.TARGET_POSITIONS, Phase.TARGET_VALUES, Phase.AD_RESOLUTION):
+        if self._phase in (
+            Phase.TARGET_POSITIONS,
+            Phase.TARGET_VALUES,
+            Phase.INTERCEPT_RESOLUTION,
+            Phase.AD_RESOLUTION,
+            Phase.DRONE_AD_STRIKE_RESOLUTION,
+            Phase.TARGET_DAMAGE_RESOLUTION,
+        ):
             return pyspiel.PlayerId.CHANCE
         if self._phase in (Phase.AD_PLACEMENT, Phase.INTERCEPT_ASSIGNMENT):
             return 1
@@ -326,11 +388,16 @@ class SwarmDefenseLargeState(pyspiel.State):
             choices = [
                 INTERCEPT_ACTION_BASE + idx
                 for idx, plan in enumerate(self._drone_plans)
-                if plan.destroyed_by is None
+                if plan.destroyed_by is None and idx not in self._interceptor_engaged
             ]
             choices.append(INTERCEPT_ACTION_BASE + NUM_ATTACKING_DRONES)
             return choices
-        if self._phase == Phase.AD_RESOLUTION:
+        if self._phase in (
+            Phase.INTERCEPT_RESOLUTION,
+            Phase.AD_RESOLUTION,
+            Phase.DRONE_AD_STRIKE_RESOLUTION,
+            Phase.TARGET_DAMAGE_RESOLUTION,
+        ):
             return [AD_RESOLVE_ACTION_BASE, AD_RESOLVE_ACTION_BASE + 1]
         return []
 
@@ -352,6 +419,14 @@ class SwarmDefenseLargeState(pyspiel.State):
                 (TARGET_VALUE_ACTION_BASE + idx, probability)
                 for idx in range(TARGET_VALUE_ACTIONS)
             ]
+        if self._phase == Phase.INTERCEPT_RESOLUTION:
+            engagement = self._pending_interceptor_hits[self._next_interceptor_resolution_index]
+            hit_prob = engagement.probability
+            miss_prob = max(0.0, 1.0 - hit_prob)
+            return [
+                (AD_RESOLVE_ACTION_BASE, miss_prob),
+                (AD_RESOLVE_ACTION_BASE + 1, hit_prob),
+            ]
         if self._phase == Phase.AD_RESOLUTION:
             intercept = self._pending_ad_targets[self._next_ad_resolution_index]
             hit_prob = intercept.probability
@@ -359,6 +434,22 @@ class SwarmDefenseLargeState(pyspiel.State):
             return [
                 (AD_RESOLVE_ACTION_BASE, miss_prob),
                 (AD_RESOLVE_ACTION_BASE + 1, hit_prob),
+            ]
+        if self._phase == Phase.DRONE_AD_STRIKE_RESOLUTION:
+            strike = self._pending_ad_strikes[self._next_ad_strike_index]
+            success = strike.probability
+            failure = max(0.0, 1.0 - success)
+            return [
+                (AD_RESOLVE_ACTION_BASE, failure),
+                (AD_RESOLVE_ACTION_BASE + 1, success),
+            ]
+        if self._phase == Phase.TARGET_DAMAGE_RESOLUTION:
+            strike = self._pending_target_strikes[self._next_target_strike_index]
+            success = strike.probability
+            failure = max(0.0, 1.0 - success)
+            return [
+                (AD_RESOLVE_ACTION_BASE, failure),
+                (AD_RESOLVE_ACTION_BASE + 1, success),
             ]
         return []
 
@@ -374,8 +465,14 @@ class SwarmDefenseLargeState(pyspiel.State):
             self._apply_drone_action(action)
         elif self._phase == Phase.INTERCEPT_ASSIGNMENT:
             self._apply_interceptor_action(action)
+        elif self._phase == Phase.INTERCEPT_RESOLUTION:
+            self._apply_interceptor_resolution(action)
         elif self._phase == Phase.AD_RESOLUTION:
             self._apply_ad_resolution(action)
+        elif self._phase == Phase.DRONE_AD_STRIKE_RESOLUTION:
+            self._apply_drone_ad_strike(action)
+        elif self._phase == Phase.TARGET_DAMAGE_RESOLUTION:
+            self._apply_target_damage_resolution(action)
         else:
             raise ValueError("Cannot apply actions in terminal state")
 
@@ -399,6 +496,7 @@ class SwarmDefenseLargeState(pyspiel.State):
             )
             for i in range(NUM_TARGETS)
         ]
+        self._target_destroyed = [False] * len(self._targets)
         self._phase = Phase.AD_PLACEMENT
 
     def _apply_ad_action(self, action: int) -> None:
@@ -420,7 +518,28 @@ class SwarmDefenseLargeState(pyspiel.State):
         self._initialize_drone_path(plan)
         self._drone_plans.append(plan)
         if len(self._drone_plans) == NUM_ATTACKING_DRONES:
-            self._phase = Phase.INTERCEPT_ASSIGNMENT
+            self._finalize_swarm_assignment()
+
+    def _finalize_swarm_assignment(self) -> None:
+        self._synchronize_tot_schedule()
+        self._phase = Phase.INTERCEPT_ASSIGNMENT
+
+    def _synchronize_tot_schedule(self) -> None:
+        if not self._drone_plans:
+            self._tot_anchor = 0.0
+            return
+        requirements = [
+            (plan.total_distance / DRONE_SPEED) - LARGE_TOT_CHOICES[plan.tot_idx]
+            for plan in self._drone_plans
+        ]
+        anchor = max(0.0, *requirements)
+        self._tot_anchor = anchor
+        for plan in self._drone_plans:
+            travel_time = plan.total_distance / DRONE_SPEED
+            desired_arrival = anchor + LARGE_TOT_CHOICES[plan.tot_idx]
+            hold_time = max(0.0, desired_arrival - travel_time)
+            plan.hold_time = hold_time
+            plan.arrival_time = hold_time + travel_time
 
     def _initialize_drone_path(self, plan: DronePlan) -> None:
         destination = self._drone_destination(plan)
@@ -437,7 +556,15 @@ class SwarmDefenseLargeState(pyspiel.State):
         bias_points = [entry] + blueprint_midpoints(strategy, ctx, self._rng)
         bias_points.append(destination)
         obstacles = self._obstacles()
-        raw = rrt_path(entry, destination, obstacles, BOUNDS, rng=self._rng, bias_points=bias_points)
+        raw = rrt_path(
+            entry,
+            destination,
+            obstacles,
+            BOUNDS,
+            rng=self._rng,
+            bias_points=bias_points,
+            time_limit_sec=RRT_TIME_LIMIT_SEC,
+        )
         refined = smooth_path(raw, obstacles, rng=self._rng)
         plan.waypoints = refined
         plan.path_samples = sample_path(refined)
@@ -458,25 +585,39 @@ class SwarmDefenseLargeState(pyspiel.State):
             if not (0 <= drone_idx < len(self._drone_plans)):
                 raise ValueError("Invalid drone index")
             plan = self._drone_plans[drone_idx]
-            if plan.destroyed_by is None:
+            if plan.destroyed_by is None and drone_idx not in self._interceptor_engaged:
                 destination = self._drone_destination(plan)
+                arrival_time = self._arrival_time(plan, plan.total_distance)
                 intercept = self._compute_interceptor_intercept(plan, destination)
                 if intercept is not None:
                     intercept_time, hit_point = intercept
-                    arrival_time = self._arrival_time(plan, plan.total_distance)
                     if intercept_time < arrival_time:
-                        plan.destroyed_by = "interceptor"
-                        plan.interceptor_hit = hit_point
-                        plan.interceptor_time = intercept_time
+                        self._pending_interceptor_hits.append(
+                            InterceptorEngagement(
+                                drone_idx=drone_idx,
+                                hit_point=hit_point,
+                                intercept_time=intercept_time,
+                            )
+                        )
+                        self._interceptor_engaged.add(drone_idx)
         self._interceptor_steps += 1
         if self._interceptor_steps == NUM_INTERCEPTORS:
-            self._start_ad_resolution()
+            self._start_post_interceptor_resolution()
 
     def _arrival_time(self, plan: DronePlan, distance: float) -> float:
-        return LARGE_TOT_CHOICES[plan.tot_idx] + distance / DRONE_SPEED
+        travel = distance / DRONE_SPEED
+        return plan.hold_time + travel
+
+    def _start_post_interceptor_resolution(self) -> None:
+        if self._pending_interceptor_hits:
+            self._phase = Phase.INTERCEPT_RESOLUTION
+            self._next_interceptor_resolution_index = 0
+        else:
+            self._start_ad_resolution()
 
     def _start_ad_resolution(self) -> None:
-        self._process_ad_targeting_effects()
+        if self._tot_anchor is None:
+            self._synchronize_tot_schedule()
         self._pending_ad_targets.clear()
         engaged: set[int] = set()
         for ad_idx, ad_unit in enumerate(self._ad_units):
@@ -488,29 +629,30 @@ class SwarmDefenseLargeState(pyspiel.State):
                 self._pending_ad_targets.append(intercept)
                 self._register_rotation_event(intercept)
         if not self._pending_ad_targets:
-            self._phase = Phase.TERMINAL
-            self._finalize_returns()
+            self._start_drone_ad_strike_resolution()
         else:
             self._phase = Phase.AD_RESOLUTION
             self._next_ad_resolution_index = 0
 
-    def _process_ad_targeting_effects(self) -> None:
-        for ad_idx, ad_unit in enumerate(self._ad_units):
-            if not ad_unit.alive:
-                continue
-            candidate = self._earliest_drone_targeting_ad(ad_idx)
-            if candidate is None:
-                continue
-            ad_unit.alive = False
-            ad_unit.destroyed_by = f"drone:{candidate}"
-            plan = self._drone_plans[candidate]
-            if plan.destroyed_by is None:
-                plan.destroyed_by = f"ad_target:{ad_idx}"
+    def _apply_interceptor_resolution(self, action: int) -> None:
+        if not self._pending_interceptor_hits:
+            raise ValueError("No interceptor engagements pending")
+        engagement = self._pending_interceptor_hits[self._next_interceptor_resolution_index]
+        plan = self._drone_plans[engagement.drone_idx]
+        success = action == AD_RESOLVE_ACTION_BASE + 1
+        if success and plan.destroyed_by is None:
+            plan.destroyed_by = "interceptor"
+            plan.interceptor_hit = engagement.hit_point
+            plan.interceptor_time = engagement.intercept_time
+        self._next_interceptor_resolution_index += 1
+        if self._next_interceptor_resolution_index >= len(self._pending_interceptor_hits):
+            self._pending_interceptor_hits.clear()
+            self._next_interceptor_resolution_index = 0
+            self._interceptor_engaged.clear()
+            self._start_ad_resolution()
 
     def _earliest_drone_targeting_ad(self, ad_idx: int) -> Optional[int]:
         best: Optional[Tuple[float, int]] = None
-        ad_unit = self._ad_units[ad_idx]
-        destination = (ad_unit.row, ad_unit.col)
         target_index = len(self._targets) + ad_idx
         for idx, plan in enumerate(self._drone_plans):
             if plan.destroyed_by is not None:
@@ -525,6 +667,7 @@ class SwarmDefenseLargeState(pyspiel.State):
     def _select_drone_for_ad(self, ad_idx: int, engaged: set[int]) -> Optional[ADIntercept]:
         ad_unit = self._ad_units[ad_idx]
         position = (ad_unit.row, ad_unit.col)
+        current_orientation = self._ad_orientation_projection.get(ad_idx, ad_unit.orientation)
         best_sort: Optional[Tuple[float, float, float, int]] = None
         best_payload: Optional[ADIntercept] = None
         for idx, plan in enumerate(self._drone_plans):
@@ -536,10 +679,11 @@ class SwarmDefenseLargeState(pyspiel.State):
             intercept_time = self._arrival_time(plan, entry_distance)
             arrival_time = self._arrival_time(plan, plan.total_distance)
             direction = _angle_between(position, entry_point)
-            rotation_delay = self._rotation_delay(ad_unit.orientation, direction)
+            rotation_delay = self._rotation_delay(current_orientation, direction)
             if intercept_time + rotation_delay >= arrival_time:
                 continue
-            probability = 1.0 - math.exp(-AD_KILL_RATE * exposure)
+            effective_exposure = max(exposure, AD_MIN_EFFECTIVE_EXPOSURE)
+            probability = 1.0 - math.exp(-AD_KILL_RATE * effective_exposure)
             if rotation_delay > 0:
                 probability *= max(0.0, 1.0 - rotation_delay / AD_ROTATION_TOLERANCE)
             probability = max(0.0, min(1.0, probability))
@@ -611,7 +755,7 @@ class SwarmDefenseLargeState(pyspiel.State):
             interceptor_distance = math.dist(launch, point)
             interceptor_time = interceptor_distance / (DRONE_SPEED * INTERCEPTOR_SPEED_MULTIPLIER)
             if drone_time >= interceptor_time:
-                return min(drone_time, interceptor_time), point
+                return drone_time, point
         return None
 
     def _drone_destination(self, plan: DronePlan) -> Tuple[float, float]:
@@ -636,17 +780,104 @@ class SwarmDefenseLargeState(pyspiel.State):
             plan.destroyed_by = f"ad:{intercept.ad_idx}"
             plan.intercepts.append((intercept.ad_idx, intercept.hit_point, intercept.intercept_time))
             ad_unit.intercept_log.append((intercept.drone_idx, intercept.hit_point, intercept.intercept_time))
-            ad_unit.orientation = intercept.direction
+        ad_unit.orientation = intercept.direction
+        self._ad_orientation_projection[intercept.ad_idx] = intercept.direction
         self._next_ad_resolution_index += 1
         if self._next_ad_resolution_index >= len(self._pending_ad_targets):
+            self._pending_ad_targets.clear()
+            self._next_ad_resolution_index = 0
+            self._start_drone_ad_strike_resolution()
+
+    def _start_drone_ad_strike_resolution(self) -> None:
+        self._pending_ad_strikes.clear()
+        self._next_ad_strike_index = 0
+        for ad_idx, ad_unit in enumerate(self._ad_units):
+            if not ad_unit.alive:
+                continue
+            candidate = self._earliest_drone_targeting_ad(ad_idx)
+            if candidate is None:
+                continue
+            plan = self._drone_plans[candidate]
+            if plan.destroyed_by is not None:
+                continue
+            self._pending_ad_strikes.append(DroneADStrike(ad_idx=ad_idx, drone_idx=candidate))
+        if self._pending_ad_strikes:
+            self._phase = Phase.DRONE_AD_STRIKE_RESOLUTION
+        else:
+            self._start_target_damage_resolution()
+
+    def _apply_drone_ad_strike(self, action: int) -> None:
+        if not self._pending_ad_strikes:
+            raise ValueError("No drone vs AD strikes pending")
+        strike = self._pending_ad_strikes[self._next_ad_strike_index]
+        ad_unit = self._ad_units[strike.ad_idx]
+        plan = self._drone_plans[strike.drone_idx]
+        success = action == AD_RESOLVE_ACTION_BASE + 1
+        if plan.destroyed_by is None:
+            plan.destroyed_by = f"ad_target:{strike.ad_idx}"
+        plan.strike_success = success
+        if success and ad_unit.alive:
+            ad_unit.alive = False
+            ad_unit.destroyed_by = f"drone:{strike.drone_idx}"
+        self._next_ad_strike_index += 1
+        if self._next_ad_strike_index >= len(self._pending_ad_strikes):
+            self._pending_ad_strikes.clear()
+            self._next_ad_strike_index = 0
+            self._start_target_damage_resolution()
+
+    def _start_target_damage_resolution(self) -> None:
+        self._pending_target_strikes.clear()
+        self._next_target_strike_index = 0
+        self._damage_from_targets = 0.0
+        if len(self._target_destroyed) != len(self._targets):
+            self._target_destroyed = [False] * len(self._targets)
+        for idx, plan in enumerate(self._drone_plans):
+            if plan.target_idx < len(self._targets):
+                plan.damage_inflicted = 0.0
+                plan.strike_success = None
+                if plan.destroyed_by is None:
+                    self._pending_target_strikes.append(
+                        DroneTargetStrike(drone_idx=idx, target_idx=plan.target_idx)
+                    )
+            else:
+                plan.damage_inflicted = 0.0
+        if self._pending_target_strikes:
+            self._phase = Phase.TARGET_DAMAGE_RESOLUTION
+        else:
+            self._phase = Phase.TERMINAL
+            self._finalize_returns()
+
+    def _apply_target_damage_resolution(self, action: int) -> None:
+        if not self._pending_target_strikes:
+            raise ValueError("No target strikes pending")
+        strike = self._pending_target_strikes[self._next_target_strike_index]
+        plan = self._drone_plans[strike.drone_idx]
+        success = action == AD_RESOLVE_ACTION_BASE + 1
+        plan.strike_success = success
+        target_idx = strike.target_idx
+        already_destroyed = (
+            0 <= target_idx < len(self._target_destroyed)
+            and self._target_destroyed[target_idx]
+        )
+        if (
+            success
+            and 0 <= target_idx < len(self._targets)
+            and not already_destroyed
+        ):
+            value = self._targets[target_idx].value
+            plan.damage_inflicted += value
+            self._damage_from_targets += value
+            if 0 <= target_idx < len(self._target_destroyed):
+                self._target_destroyed[target_idx] = True
+        self._next_target_strike_index += 1
+        if self._next_target_strike_index >= len(self._pending_target_strikes):
+            self._pending_target_strikes.clear()
+            self._next_target_strike_index = 0
             self._phase = Phase.TERMINAL
             self._finalize_returns()
 
     def _finalize_returns(self) -> None:
-        total_damage = 0.0
-        for plan in self._drone_plans:
-            if plan.destroyed_by is None and plan.target_idx < len(self._targets):
-                total_damage += self._targets[plan.target_idx].value
+        total_damage = self._damage_from_targets
         self._returns = [total_damage, -total_damage]
 
     def is_terminal(self) -> bool:

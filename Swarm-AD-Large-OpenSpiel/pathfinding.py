@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -109,13 +110,19 @@ def rrt_path(
     goal_sample_prob: float = 0.2,
     max_iters: int = 1200,
     bias_points: Optional[Sequence[Point]] = None,
+    time_limit_sec: Optional[float] = None,
 ) -> List[Point]:
     """Computes an obstacle-aware RRT path."""
     if rng is None:
         rng = random.Random()
     nodes: List[Point] = [bounds.clamp(start)]
     parents: List[int] = [-1]
+    best_goal_idx = 0
+    best_goal_dist = math.dist(nodes[0], goal)
+    deadline = None if time_limit_sec is None else time.perf_counter() + max(0.0, time_limit_sec)
     for _ in range(max_iters):
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
         sample = _biased_sample(goal, bounds, rng, goal_bias=goal_sample_prob, bias_points=bias_points)
         nearest_idx = _nearest(nodes, sample)
         candidate = _step_towards(nodes[nearest_idx], sample, step_size, bounds)
@@ -123,12 +130,27 @@ def rrt_path(
             continue
         nodes.append(candidate)
         parents.append(nearest_idx)
+        candidate_goal_dist = math.dist(candidate, goal)
+        if candidate_goal_dist < best_goal_dist:
+            best_goal_dist = candidate_goal_dist
+            best_goal_idx = len(nodes) - 1
         if segment_clear(candidate, goal, obstacles):
             nodes.append(goal)
             parents.append(len(nodes) - 2)
+            best_goal_idx = len(nodes) - 1
             break
     if len(nodes) == 1:
         return [start, goal]
+    if nodes[-1] != goal:
+        connector_idx = best_goal_idx
+        probe_idx = best_goal_idx
+        while probe_idx >= 0:
+            if segment_clear(nodes[probe_idx], goal, obstacles):
+                connector_idx = probe_idx
+                break
+            probe_idx = parents[probe_idx]
+        nodes.append(goal)
+        parents.append(connector_idx)
     path = []
     idx = len(nodes) - 1
     while idx >= 0:

@@ -35,7 +35,8 @@ AD_TARGET_KILL_COLOR = "#2E8B57"
 @dataclass
 class DroneSeries:
     entry: Tuple[float, float]
-    tot: float
+    tot_offset: float
+    start_time: float
     times: List[float]
     points: List[Tuple[float, float]]
     destroyed_time: Optional[float]
@@ -81,12 +82,12 @@ def _tot_color(tot: float) -> str:
 
 def _kill_event(drone: Dict[str, object], ad_positions: Dict[int, Tuple[float, float]]) -> Optional[Dict[str, object]]:
     destroyed = str(drone.get("destroyed_by") or "")
-    tot = float(drone.get("tot") or 0.0)
+    hold = float(drone.get("hold_time") or 0.0)
     intercepts: Sequence[Tuple[int, Tuple[float, float], float]] = drone.get("intercepts", ())
     if destroyed.startswith("ad:") and intercepts:
         ad_idx, hit_point, intercept_time = intercepts[0]
         kill_time = float(intercept_time)
-        kill_distance = max(0.0, (kill_time - tot) * DRONE_SPEED)
+        kill_distance = max(0.0, (kill_time - hold) * DRONE_SPEED)
         return {
             "type": "ad",
             "point": tuple(hit_point),
@@ -98,7 +99,7 @@ def _kill_event(drone: Dict[str, object], ad_positions: Dict[int, Tuple[float, f
         kill_time = drone.get("interceptor_time")
         if hit is not None and kill_time is not None:
             kill_time = float(kill_time)
-            kill_distance = max(0.0, (kill_time - tot) * DRONE_SPEED)
+            kill_distance = max(0.0, (kill_time - hold) * DRONE_SPEED)
             return {
                 "type": "interceptor",
                 "point": tuple(hit),
@@ -115,7 +116,7 @@ def _kill_event(drone: Dict[str, object], ad_positions: Dict[int, Tuple[float, f
         entry = drone.get("entry")
         kill_point = tuple(ad_point or destination or entry)
         total_distance = float(drone.get("total_distance") or 0.0)
-        kill_time = tot + total_distance / DRONE_SPEED
+        kill_time = hold + total_distance / DRONE_SPEED
         return {
             "type": "ad_target",
             "point": kill_point,
@@ -133,6 +134,7 @@ def _prepare_drone_series(snapshot: Dict[str, object]) -> List[DroneSeries]:
     for drone in drones:
         entry = tuple(drone["entry"])  # type: ignore[arg-type]
         tot = float(drone.get("tot") or 0.0)
+        hold = float(drone.get("hold_time") or 0.0)
         samples: Sequence[Tuple[float, float, float]] = drone.get("path_samples", ())
         kill = _kill_event(drone, ad_positions)
         kill_distance = kill.get("distance") if isinstance(kill, dict) else None
@@ -140,7 +142,7 @@ def _prepare_drone_series(snapshot: Dict[str, object]) -> List[DroneSeries]:
         points: List[Tuple[float, float]] = []
         prev_sample: Optional[Tuple[float, float, float]] = None
         for row, col, dist in samples:
-            times.append(tot + dist / DRONE_SPEED)
+            times.append(hold + dist / DRONE_SPEED)
             points.append((row, col))
             if kill_distance is not None and dist >= kill_distance:
                 if dist > kill_distance and prev_sample is not None and dist != prev_sample[2]:
@@ -153,23 +155,23 @@ def _prepare_drone_series(snapshot: Dict[str, object]) -> List[DroneSeries]:
                     points[-1] = interp
                     times[-1] = tot + kill_distance / DRONE_SPEED
                 else:
-                    times[-1] = tot + kill_distance / DRONE_SPEED
+                    times[-1] = hold + kill_distance / DRONE_SPEED
                 break
             prev_sample = (row, col, dist)
         if not times:
-            times = [tot]
+            times = [hold]
             points = [entry]
         destroyed_time: Optional[float] = kill.get("time") if isinstance(kill, dict) else None
         kill_point = kill.get("point") if isinstance(kill, dict) else None
         kill_type = kill.get("type") if isinstance(kill, dict) else None
         color = _tot_color(tot)
-        series.append(DroneSeries(entry, tot, times, points, destroyed_time, color, kill_point, kill_type))
+        series.append(DroneSeries(entry, tot, hold, times, points, destroyed_time, color, kill_point, kill_type))
     return series
 
 
 def _prefix_path(drone: DroneSeries, t: float) -> List[Tuple[float, float]]:
     points = [drone.entry]
-    prev_time = drone.tot
+    prev_time = drone.start_time
     prev_point = drone.entry
     for time, point in zip(drone.times, drone.points):
         if t >= time:
@@ -191,9 +193,9 @@ def _prefix_path(drone: DroneSeries, t: float) -> List[Tuple[float, float]]:
 
 
 def _position_at(drone: DroneSeries, t: float) -> Tuple[float, float]:
-    if t <= drone.tot:
+    if t <= drone.start_time:
         return drone.entry
-    prev_time = drone.tot
+    prev_time = drone.start_time
     prev_point = drone.entry
     for time, point in zip(drone.times, drone.points):
         if t <= time:

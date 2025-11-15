@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, validator
 
@@ -48,6 +49,19 @@ class PyTakRuntimeConfig(BaseModel):
     dry_run: bool = Field(False, description="Print CoT without transmitting.")
     export_file: Optional[str] = Field(None, description="Optional path to write CoT stream.")
     step_delay: float = Field(1.0, description="Seconds between CoT snapshots.")
+
+    @validator("cot_endpoint")
+    def validate_cot_endpoint(cls, value: str) -> str:  # noqa: D401
+        """Ensure the endpoint uses a supported transport scheme for PyTak."""
+        parsed = urlparse(value)
+        scheme = (parsed.scheme or "").lower()
+        if not scheme:
+            raise ValueError("cot_endpoint must include a transport scheme such as udp:// or tcp://")
+        if scheme in {"http", "https"}:
+            raise ValueError(
+                "HTTP(S) endpoints are not valid for CoT streaming; use udp://, udp+wo://, tcp://, or tls://"
+            )
+        return value
 
     def to_pytak_config(self) -> Dict[str, str]:
         return {
