@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import socket
 import sys
@@ -25,6 +26,45 @@ AD_FOV_HALF_ANGLE = math.radians(35.0)
 AD_FOV_SEGMENTS = 12
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SNAPSHOT_PATH = PROJECT_ROOT / "Visualizer" / "swarm_large_snapshot.json"
+
+
+def _snapshot_path_from_summary(summary_path: Path) -> Optional[Path]:
+    """Resolve the WinTAK snapshot path stored in an inference summary file."""
+
+    try:
+        with summary_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        print(f"Warning: Summary file not found: {summary_path}")
+        return None
+    except json.JSONDecodeError as exc:
+        print(f"Warning: Could not parse summary {summary_path}: {exc}")
+        return None
+
+    snapshot_str = payload.get("wintak_snapshot_path") or payload.get("snapshot_json_path")
+    if not snapshot_str:
+        print(f"Warning: Summary {summary_path} does not reference a WinTAK snapshot.")
+        return None
+
+    candidate = Path(snapshot_str)
+    if not candidate.is_absolute():
+        candidate = summary_path.parent / candidate
+    return candidate
+
+
+def _resolve_snapshot_source(args: argparse.Namespace) -> Tuple[Optional[Path], str]:
+    """Determine which snapshot path to replay based on CLI arguments."""
+
+    if args.fresh_run:
+        return None, "disabled (fresh run)"
+    if args.summary is not None:
+        summary_snapshot = _snapshot_path_from_summary(args.summary)
+        if summary_snapshot is not None:
+            note = f"{summary_snapshot} (from summary {args.summary})"
+            return summary_snapshot, note
+        note = f"{args.snapshot} (from --snapshot; summary unavailable)"
+        return args.snapshot, note
+    return args.snapshot, str(args.snapshot)
 
 
 def _build_ad_fov_detail(
@@ -359,6 +399,15 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--summary",
+        type=Path,
+        default=None,
+        help=(
+            "Path to an ESCHER-Torch run_swarm_large_inference episode_summary.json file. "
+            "The referenced WinTAK snapshot will be replayed."
+        ),
+    )
+    parser.add_argument(
         "--fresh-run",
         action="store_true",
         help="Ignore any snapshot file and generate a brand-new simulated episode",
@@ -424,16 +473,15 @@ def main() -> int:
     effective_interval = max(args.interval / fps_multiplier, 0.05)
     effective_flash_period = max(DEFAULT_AD_FLASH_PERIOD / fps_multiplier, 0.2)
 
-    snapshot_path = None if args.fresh_run else args.snapshot
+    snapshot_path, snapshot_note = _resolve_snapshot_source(args)
     print(f"Time step: {args.time_step}s (effective {effective_time_step:.3f}s @ {fps_multiplier:.1f}x fps)")
     print(f"Update interval: {args.interval}s (effective {effective_interval:.3f}s)")
     print(f"Target: tcp://{args.host}:{args.port}")
     print(f"Prefix: {args.prefix}")
     print(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
-    if snapshot_path is None:
-        print("Snapshot source: disabled (fresh run)")
-    else:
-        print(f"Snapshot source: {snapshot_path}")
+    if args.summary is not None:
+        print(f"Summary file: {args.summary}")
+    print(f"Snapshot source: {snapshot_note}")
     print("=" * 60)
     print()
     

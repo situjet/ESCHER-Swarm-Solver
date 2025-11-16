@@ -36,11 +36,32 @@ python generate_cot_sequence.py --seed 42 --time-step 0.5 --interval 0.5 --fps-m
 
 Use `--snapshot /path/to/snapshot.json` to point at a different exported episode, or `--fresh-run` to ignore snapshots and synthesize a brand-new engagement.
 
+### Replaying ESCHER-Torch inference runs
+
+1. Run the policy inference helper. Each episode directory now contains a WinTAK-ready JSON snapshot alongside the GIF/PNG artifacts (disable via `--no-wintak-snapshot` if you do not need it):
+
+	```bash
+	python ESCHER-Torch/run_swarm_large_inference.py \
+	  --checkpoint ESCHER-Torch/results/swarm_defense_large_v2/2025_11_15_19_06_19 \
+	  --scenario-mode single --episodes 1 --seed 4 --no-animation --no-snapshot
+	```
+
+2. Point the generator at the resulting `episode_summary.json`. The script resolves the `wintak_snapshot.json` referenced inside the summary and replays it frame-for-frame on TAK:
+
+	```bash
+	python WinTAK-CoT-Generator/generate_cot_sequence.py \
+	  --summary ESCHER-Torch/results/swarm_defense_large_v2/inference_runs/episode_01_seed_4/episode_summary.json \
+	  --dry-run
+	```
+
+This workflow guarantees your TAK feed is a perfect replica of the policy rollout captured during inference, without re-simulating any randomness.
+
 ### Key options
 
 - `--fps-multiplier` – scales both the simulator step and CoT send interval. A value of 2 doubles the effective frame rate without changing your original CLI arguments.
 - `--time-step` / `--interval` – base cadence before the FPS multiplier is applied.
 - `--snapshot` – path to the Swarm-AD-Large snapshot JSON to replay (defaults to `Visualizer/swarm_large_snapshot.json`).
+- `--summary` – path to an `episode_summary.json` emitted by `run_swarm_large_inference.py`; automatically loads the referenced snapshot.
 - `--fresh-run` – skip snapshot replay and generate a brand-new scenario.
 - `--dry-run` – print events instead of sending them to WinTAK for quick inspection.
 
