@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from swarm_defense_large_game import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "Visualizer"
 OUTPUT_PATH = OUTPUT_DIR / "swarm_defense_large_animation.gif"
+SNAPSHOT_OUTPUT_PATH = OUTPUT_DIR / "swarm_large_snapshot.json"
 DRONE_SPEED = 1.0
 AD_KILL_COLOR = "#FF3B30"
 AD_KILL_EDGE = "black"
@@ -38,6 +40,53 @@ TARGET_KILL_COLOR = "#F1C40F"
 TARGET_KILL_EDGE = "#7D6608"
 TARGET_KILL_MARKER = "P"
 WAVE_MARKERS = {1: "s", 2: "D", 3: "P"}
+
+def _write_snapshot(snapshot: Dict[str, object], output_path: Path) -> Path:
+    """Persist the large-game snapshot for downstream consumers (e.g., WinTAK)."""
+
+    def _normalize_targets(raw_targets: Sequence[object]) -> List[Dict[str, float]]:
+        normalized: List[Dict[str, float]] = []
+        for target in raw_targets:
+            if hasattr(target, "row"):
+                normalized.append(
+                    {
+                        "row": float(getattr(target, "row")),
+                        "col": float(getattr(target, "col")),
+                        "value": float(getattr(target, "value")),
+                    }
+                )
+            elif isinstance(target, dict):
+                normalized.append(
+                    {
+                        "row": float(target.get("row", 0.0)),
+                        "col": float(target.get("col", 0.0)),
+                        "value": float(target.get("value", 0.0)),
+                    }
+                )
+            elif isinstance(target, (list, tuple)) and len(target) >= 3:
+                row, col, value = target[:3]
+                normalized.append(
+                    {
+                        "row": float(row),
+                        "col": float(col),
+                        "value": float(value),
+                    }
+                )
+        return normalized
+
+    safe_snapshot = dict(snapshot)
+    safe_snapshot["targets"] = _normalize_targets(snapshot.get("targets", ()))
+    safe_snapshot["target_destroyed"] = list(snapshot.get("target_destroyed", ()))
+    safe_snapshot["ad_units"] = [dict(unit) for unit in snapshot.get("ad_units", ())]
+    safe_snapshot["drones"] = [dict(drone) for drone in snapshot.get("drones", ())]
+    safe_snapshot["returns"] = list(snapshot.get("returns", ()))
+    safe_snapshot["discovered_ads"] = list(snapshot.get("discovered_ads", ()))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(safe_snapshot, handle, indent=2, sort_keys=True)
+    return output_path
+
 
 
 @dataclass
@@ -744,6 +793,12 @@ def main() -> None:
     parser.add_argument("--fps", type=int, default=12, help="Frames per second for the GIF")
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="Output animation path")
     parser.add_argument(
+        "--snapshot-output",
+        type=Path,
+        default=SNAPSHOT_OUTPUT_PATH,
+        help="Where to store the JSON snapshot for WinTAK/CoT export",
+    )
+    parser.add_argument(
         "--allow-early-ad-targets",
         action="store_true",
         help="Permit AD strikes before discovery (defaults to requiring discovery).",
@@ -753,9 +808,11 @@ def main() -> None:
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 2**31 - 1)
     require_ad_discovery = not args.allow_early_ad_targets
     final_state = rollout_two_wave_episode(seed, require_ad_discovery=require_ad_discovery)
+    snapshot_path = _write_snapshot(final_state.snapshot(), args.snapshot_output)
     _build_animation(final_state, args.output, time_step=args.time_step, fps=args.fps)
     print("Animation complete.")
     print(f"Seed: {seed}")
+    print(f"Snapshot saved to: {snapshot_path}")
     print(f"Animation saved to: {args.output}")
 
 

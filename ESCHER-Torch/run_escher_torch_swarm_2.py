@@ -60,13 +60,13 @@ DESTROYED_TO_INDEX = {
 }
 
 DEFAULT_CONFIG = {
-    "num_iterations": 5,
+    "num_iterations": 10,
     "num_traversals": 100,
     "num_val_traversals": 10,
     "num_workers": 1,
-    "batch_size_regret": 2000,
+    "batch_size_regret": 1024,
     "batch_size_value": 256,
-    "batch_size_policy": 2000,
+    "batch_size_policy": 1024,
     "train_steps": 200,
     "learning_rate": 1e-3,
 }
