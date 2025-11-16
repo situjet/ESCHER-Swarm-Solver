@@ -1,0 +1,29 @@
+# Example configuration for `run_escher_torch_swarm.py`
+# Invoke via: python run_escher_torch_swarm.py --config configs/swarm_example.yaml
+
+# Global toggles
+num_cpu_threads: 1        # CPU threads for PyTorch tensor math (independent from traversal workers)
+test_mode: false          # Force lightweight hyperparameters
+
+# Training overrides (merge on top of defaults)
+training:
+  num_iterations: 10
+  num_traversals: 100
+  num_val_traversals: 40
+  num_workers: 1          # keep at 1; parallel traversal is disabled in the script
+  batch_size_regret: 128
+  batch_size_value: 32
+  batch_size_policy: 128
+  train_steps: 250
+  # test_mode: true       # Optional: override per-file if desired
+
+# Game parameters passed directly to pyspiel.load_game()
+game:
+  grid_rows: 8
+  grid_cols: 6
+  num_targets: 2
+  num_ad_units: 2
+  num_attacking_drones: 4
+  num_interceptors: 2
+  ad_kill_probability: 0.8  # Direct kill probability per unit of exposure (0.0 to 1.0)
+  interceptor_reward: 1.5
