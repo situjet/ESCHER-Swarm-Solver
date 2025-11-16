@@ -11,15 +11,16 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import pyspiel
 
-GRID_SIZE = 16
+# Constants can be overridden via environment variables
+GRID_SIZE = int(os.environ.get("GRID_SIZE", "16"))
+NUM_TARGETS = int(os.environ.get("NUM_TARGETS", "3"))
+NUM_AD_UNITS = int(os.environ.get("NUM_AD_UNITS", "2"))
+NUM_ATTACKING_DRONES = int(os.environ.get("NUM_ATTACKING_DRONES", "10"))
+NUM_INTERCEPTORS = int(os.environ.get("NUM_INTERCEPTORS", "5"))
 BOTTOM_HALF_START = GRID_SIZE // 2
-NUM_TARGETS = 3
-NUM_AD_UNITS = 2
-NUM_ATTACKING_DRONES = 10
-NUM_INTERCEPTORS = 5
 TOT_CHOICES: Tuple[float, ...] = (0.0, 2.0, 4.0)
 TARGET_VALUE_OPTIONS: Tuple[float, ...] = (10.0, 20.0, 40.0)
-AD_COVERAGE_RADIUS = 3.0
+AD_COVERAGE_RADIUS = 2.0
 AD_STRIDE = 2
 TARGET_SPEED = 1.0
 INTERCEPTOR_SPEED_MULTIPLIER = 2.0
@@ -36,11 +37,22 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 AD_KILL_RATE = _env_float("SWARM_AD_KILL_RATE", 2.8)  # per unit distance inside bubble
 AD_MIN_EFFECTIVE_EXPOSURE = 0.75
 INTERCEPTOR_KILL_PROB = 0.95
 DRONE_VS_AD_KILL_PROB = 0.8
 DRONE_VS_TARGET_KILL_PROB = 0.7
+INTERCEPTOR_REWARD = _env_float("INTERCEPTOR_REWARD", 1)  # reward per intercepted drone
 
 TARGET_CANDIDATE_CELLS: List[Tuple[int, int]] = [
     (row, col)
@@ -856,7 +868,11 @@ class SwarmDefenseState(pyspiel.State):
 
     def _finalize_returns(self) -> None:
         total_damage = self._damage_from_targets
-        self._returns = [total_damage, -total_damage]
+        # Count interceptor kills and add reward for defender
+        interceptor_kills = sum(1 for plan in self._drone_plans if plan.destroyed_by == "interceptor")
+        interceptor_bonus = interceptor_kills * INTERCEPTOR_REWARD
+        # Attacker gets damage done minus interceptor penalty, defender gets opposite
+        self._returns = [total_damage - interceptor_bonus, -total_damage + interceptor_bonus]
 
     def is_terminal(self) -> bool:
         return self._phase == Phase.TERMINAL
@@ -978,13 +994,15 @@ _GAME_TYPE = pyspiel.GameType(
 )
 
 _MAX_DAMAGE = NUM_ATTACKING_DRONES * max(TARGET_VALUE_OPTIONS)
+_MAX_INTERCEPTOR_BONUS = NUM_ATTACKING_DRONES * INTERCEPTOR_REWARD
+_MAX_UTILITY = _MAX_DAMAGE + _MAX_INTERCEPTOR_BONUS
 
 _GAME_INFO = pyspiel.GameInfo(
     num_distinct_actions=NUM_DISTINCT_ACTIONS,
     max_chance_outcomes=max(len(TARGET_CANDIDATE_CELLS), len(TARGET_VALUE_PERMUTATIONS), 2),
     num_players=2,
-    min_utility=-float(_MAX_DAMAGE),
-    max_utility=float(_MAX_DAMAGE),
+    min_utility=-float(_MAX_UTILITY),
+    max_utility=float(_MAX_UTILITY),
     utility_sum=0.0,
     max_game_length=
     NUM_TARGETS  # target positions
