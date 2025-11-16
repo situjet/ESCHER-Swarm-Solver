@@ -1,0 +1,60 @@
+# Example configuration for `demo_visualizer.py`
+# Invoke via: python demo_visualizer.py --config demo_config.yaml
+#
+# You can also override parameters via command line:
+#   python demo_visualizer.py --config demo_config.yaml --seed 42 --num_targets 3
+
+# Game parameters passed directly to pyspiel.load_game()
+# These define the game configuration for visualization
+game:
+  # Grid dimensions
+  grid_rows: 8          # Number of rows in the game grid
+  grid_cols: 6          # Number of columns in the game grid
+  
+  # Game entities
+  num_targets: 2         # Number of target clusters to defend
+  num_ad_units: 2        # Number of Air Defense units (autonomous launchers)
+  num_attacking_drones: 4  # Number of attacking drones in the swarm
+  num_interceptors: 2    # Number of manned interceptor units
+  
+  # Game mechanics
+  ad_kill_probability: 0.8  # Direct kill probability per unit of exposure (0.0 to 1.0)
+                            # Higher values = more lethal AD units
+  interceptor_reward: 1.5    # Reward points for defender per interceptor kill
+
+# ============================================================================
+# Alternative configurations (comment/uncomment to use):
+# ============================================================================
+
+# Small/Quick Test Configuration:
+# game:
+#   grid_rows: 8
+#   grid_cols: 6
+#   num_targets: 2
+#   num_ad_units: 2
+#   num_attacking_drones: 4
+#   num_interceptors: 2
+#   ad_kill_probability: 0.8
+#   interceptor_reward: 1.5
+
+# Medium Configuration:
+# game:
+#   grid_rows: 12
+#   grid_cols: 12
+#   num_targets: 3
+#   num_ad_units: 3
+#   num_attacking_drones: 6
+#   num_interceptors: 3
+#   ad_kill_probability: 0.7
+#   interceptor_reward: 2.0
+
+# Large/Default Configuration:
+# game:
+#   grid_rows: 16
+#   grid_cols: 16
+#   num_targets: 3
+#   num_ad_units: 2
+#   num_attacking_drones: 10
+#   num_interceptors: 5
+#   ad_kill_probability: 0.8
+#   interceptor_reward: 1.0

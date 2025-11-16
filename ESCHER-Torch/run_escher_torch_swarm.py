@@ -25,32 +25,123 @@ Parallelization:
 For faster testing: reduce num_iterations and num_traversals
 For better convergence: increase to 50+ iterations, 500+ traversals (and scale batch sizes)
 """
+import argparse
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, Optional
 
-import torch
 import pyspiel
+import torch
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - handled at runtime if config is requested
+    yaml = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT.parent / "Swarm-AD-OpenSpielReset"))
 sys.path.insert(0, str(PROJECT_ROOT.parent / "Swarm-AD-OpenSpiel"))
 
 import swarm_defense_game  # noqa: F401
 from ESCHER_Torch import ESCHERSolverTorch
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train ESCHER-Torch on the Swarm Defense game.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to a YAML configuration file containing game/training parameters.",
+    )
+    parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="Force test-mode hyperparameters regardless of YAML configuration.",
+    )
+    return parser.parse_args()
+
+
+def _load_yaml_config(config_path: Optional[Path]) -> Dict[str, Any]:
+    if config_path is None:
+        return {}
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to load configuration files (pip install pyyaml).")
+    expanded = config_path.expanduser()
+    with expanded.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Configuration file {expanded} must contain a top-level mapping.")
+    return data
+
+
 def main() -> None:
+    args = _parse_args()
+    yaml_config = _load_yaml_config(args.config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    num_cpu_threads = int(yaml_config.get("num_cpu_threads", 1))
+    
+    training_overrides_raw = yaml_config.get("training", {})
+    if training_overrides_raw and not isinstance(training_overrides_raw, dict):
+        raise ValueError("`training` section in YAML must be a mapping.")
+    training_overrides = dict(training_overrides_raw or {})
+    
+    yaml_test_mode = training_overrides.pop("test_mode", None)
+    if yaml_test_mode is None:
+        yaml_test_mode = yaml_config.get("test_mode")
+    test_mode = bool(yaml_test_mode) if yaml_test_mode is not None else False
+    if args.test_mode:
+        test_mode = True
+    
+    test_defaults = {
+        "num_iterations": 3,
+        "num_traversals": 10,
+        "num_val_traversals": 5,
+        "num_workers": 1,
+        "batch_size_regret": 60,
+        "batch_size_value": 60,
+        "batch_size_policy": 60,
+        "train_steps": 50,
+    }
+    prod_defaults = {
+        "num_iterations": 8,
+        "num_traversals": 100,
+        "num_val_traversals": 10,
+        "num_workers": 1,
+        "batch_size_regret": 50,
+        "batch_size_value": 40,
+        "batch_size_policy": 64,
+        "train_steps": 200,
+    }
+    training_config = (test_defaults if test_mode else prod_defaults).copy()
+    training_config.update(training_overrides)
+    
+    game_params_section = (
+        yaml_config.get("game")
+        or yaml_config.get("game_parameters")
+        or yaml_config.get("game_params")
+    )
+    if game_params_section is not None and not isinstance(game_params_section, dict):
+        raise ValueError("`game` configuration must be provided as a mapping.")
+    game_params = dict(game_params_section or {})
     
     # Set PyTorch CPU threads early (before any torch operations)
-    # This allows PyTorch operations to use multiple CPU cores
-    num_cpu_threads = 1  # Adjust based on your CPU cores
+    # This controls how many CPU threads PyTorch uses inside matrix/vector ops.
+    # It is separate from ESCHER's tree-traversal workers.
     torch.set_num_threads(num_cpu_threads)
     torch.set_num_interop_threads(num_cpu_threads)
-    print(f"🔧 PyTorch CPU threads: {num_cpu_threads}")
+    print(f"🔧 PyTorch CPU threads: {num_cpu_threads} (affects tensor math, not traversal workers)")
     
-    game = pyspiel.load_game("swarm_defense")
+    if game_params:
+        print("📄 Loading swarm_defense with YAML parameters:")
+        for key, value in game_params.items():
+            print(f"   - {key}: {value}")
+        print()
+    game = pyspiel.load_game("swarm_defense", params=game_params)
         
     initial_state = game.new_initial_state()
     tensor_size = len(initial_state.information_state_tensor(0))
@@ -65,29 +156,23 @@ def main() -> None:
     print(f"Average clone time: {clone_time:.2f}ms ({1000/clone_time:.0f} clones/sec)")
     print()
 
-    # Configuration
-    TEST_MODE = False  # Set True for quick testing (2 min), False for production (30-60 min)
-    
-    if TEST_MODE:
+    if test_mode:
         print("🧪 TEST MODE: Running minimal configuration for quick validation\n")
-        num_iterations = 3
-        num_traversals = 10
-        num_val_traversals = 5
-        num_workers = 1
-        batch_size_regret = 60
-        batch_size_value = 60
-        batch_size_policy = 60
-        train_steps = 50
     else:
         print("🚀 PRODUCTION MODE: Full training configuration\n")
-        num_iterations = 8
-        num_traversals = 100
-        num_val_traversals = 10
-        num_workers = 1  # Parallel tree traversal workers (CPU cores)
-        batch_size_regret = 50
-        batch_size_value = 40  # Reduced: 20 traversals → ~40-80 samples (was 128)
-        batch_size_policy = 64  # Reduced to ensure enough samples (was 128)
-        train_steps = 200
+    num_iterations = int(training_config["num_iterations"])
+    num_traversals = int(training_config["num_traversals"])
+    num_val_traversals = int(training_config["num_val_traversals"])
+    num_workers = int(training_config["num_workers"])
+    if num_workers > 1:
+        raise RuntimeError(
+            "ESCHER parallel traversal (num_workers > 1) is currently disabled due to stability issues. "
+            "Please set num_workers=1 in your configuration."
+        )
+    batch_size_regret = int(training_config["batch_size_regret"])
+    batch_size_value = int(training_config["batch_size_value"])
+    batch_size_policy = int(training_config["batch_size_policy"])
+    train_steps = int(training_config["train_steps"])
     
     speedup = min(num_workers, 4) if num_workers > 1 else 1
     print(f"Device: {device} | Workers: {num_workers} | Iterations: {num_iterations} | Traversals/iter: {num_traversals}")
@@ -145,7 +230,37 @@ def main() -> None:
     value_path = checkpoint_dir / "value.pt"
     torch.save(solver._value_network.state_dict(), str(value_path))
     
-    # Save metadata (hyperparameters and training info)
+    # Capture complete game configuration
+    config_obj = getattr(game, "config", None)
+    parameter_snapshot: Dict[str, Any]
+    if config_obj is not None:
+        parameter_snapshot = {
+            "grid_rows": config_obj.grid_rows,
+            "grid_cols": config_obj.grid_cols,
+            "num_targets": config_obj.num_targets,
+            "num_ad_units": config_obj.num_ad_units,
+            "num_attacking_drones": config_obj.num_attacking_drones,
+            "num_interceptors": config_obj.num_interceptors,
+            "ad_kill_rate": config_obj.ad_kill_rate,
+            "interceptor_reward": config_obj.interceptor_reward,
+        }
+    else:
+        parameter_snapshot = dict(game_params)
+    
+    game_config = {
+        "parameters": parameter_snapshot,
+        "requested_parameters": game_params,
+        "TOT_CHOICES": list(swarm_defense_game.TOT_CHOICES),
+        "TARGET_VALUE_OPTIONS": list(swarm_defense_game.TARGET_VALUE_OPTIONS),
+        "AD_COVERAGE_RADIUS": swarm_defense_game.AD_COVERAGE_RADIUS,
+        "num_phases": len(swarm_defense_game.Phase),
+        "phase_names": [p.name for p in swarm_defense_game.Phase],
+        "state_tensor_size": tensor_size,
+        "value_network_input_size": tensor_size * 2,
+        "num_distinct_actions": game.num_distinct_actions(),
+    }
+    
+    # Save metadata (hyperparameters, training info, and game config)
     metadata = {
         "timestamp": timestamp,
         "num_iterations": num_iterations,
@@ -160,6 +275,11 @@ def main() -> None:
         "total_time_seconds": sum(iteration_times),
         "final_exploitability": convs[-1] if convs else None,
         "device": device,
+        "num_cpu_threads": num_cpu_threads,
+        "test_mode": test_mode,
+        "config_file": str(args.config) if args.config else None,
+        "training_overrides": training_overrides,
+        "game_config": game_config,  # Complete game configuration
     }
     metadata_path = checkpoint_dir / "metadata.pt"
     torch.save(metadata, str(metadata_path))
@@ -172,11 +292,11 @@ def main() -> None:
     print(f"   - Policy network: policy.pt")
     print(f"   - Regret networks: regret_player0.pt, regret_player1.pt")
     print(f"   - Value network: value.pt")
-    print(f"   - Metadata: metadata.pt")
+    print(f"   - Metadata + Game Config: metadata.pt")
+    print(f"       → State size: {tensor_size}, Actions: {game.num_distinct_actions()}, Phases: {len(swarm_defense_game.Phase)}")
     if convs:
         print(f"   - Exploitability curve: {output_dir}/swarm_convs.npy")
 
 
 if __name__ == "__main__":
     main()
-
