@@ -556,6 +556,9 @@ class SwarmDefenseState(pyspiel.State):
                     actions.append(self.action_info["ad_base"] + idx)
             return actions
         if self._phase == Phase.SWARM_ASSIGNMENT:
+            # Only return legal actions if we haven't assigned all drones yet
+            if len(self._drone_plans) >= self.config.num_attacking_drones:
+                return []  # No legal actions if all drones are already assigned
             return [self.action_info["drone_base"] + i for i in range(self.action_info["drone_assignment_actions"])]
         if self._phase == Phase.INTERCEPT_ASSIGNMENT:
             choices = [
