@@ -1,0 +1,8 @@
+# Requirements for WinTAK CoT Generator
+
+# No external dependencies required for basic functionality
+# The script will fallback to synthetic data if pyspiel is not available
+
+# Optional: For full game simulation
+# pyspiel (requires compilation from source)
+# Available at: https://github.com/deepmind/open_spiel

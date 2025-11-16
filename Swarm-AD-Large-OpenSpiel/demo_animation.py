@@ -30,6 +30,11 @@ AD_KILL_EDGE = "black"
 INTERCEPTOR_KILL_COLOR = "#0bc5ea"
 AD_TARGET_KILL_COLOR = "#2E8B57"
 AD_ROTATION_ARROW_COLOR = "#1f4c94"
+INTERCEPTOR_ORIGIN = (30.0, 0.0)
+INTERCEPTOR_VISUAL_DURATION = 3.0
+TARGET_KILL_COLOR = "#F1C40F"
+TARGET_KILL_EDGE = "#7D6608"
+TARGET_KILL_MARKER = "P"
 
 
 def _normalize_angle(angle: float) -> float:
@@ -228,6 +233,30 @@ def _max_time(series: Sequence[DroneSeries]) -> float:
     return max_t + 2.0
 
 
+def _status_counts(series: Sequence[DroneSeries], t: float) -> Dict[str, int]:
+    counts = {
+        "targets": 0,
+        "ad": 0,
+        "interceptor": 0,
+        "active": 0,
+    }
+    for drone in series:
+        resolved = drone.destroyed_time is not None and t >= drone.destroyed_time
+        if resolved and drone.kill_type:
+            if drone.kill_type == "ad_target":
+                counts["targets"] += 1
+            elif drone.kill_type == "ad":
+                counts["ad"] += 1
+            elif drone.kill_type == "interceptor":
+                counts["interceptor"] += 1
+            else:
+                counts["ad"] += 1
+        else:
+            counts["active"] += 1
+    counts["destroyed"] = len(series) - counts["active"]
+    return counts
+
+
 def _orientation_from_events(
     base_orientation: float,
     events: Sequence[Tuple[float, float]],
@@ -290,10 +319,16 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
     path_lines = [ax.plot([], [], color=ser.color, linewidth=2)[0] for ser in series]
     kill_markers: List[Optional[object]] = []
     kill_pulses: List[Optional[patches.Circle]] = []
+    interceptor_traces: List[Optional[Dict[str, object]]] = []
+    interceptor_origin = (
+        INTERCEPTOR_ORIGIN[0],
+        min(max(INTERCEPTOR_ORIGIN[1], 0.0), ARENA_WIDTH),
+    )
     for ser in series:
         if ser.kill_point is None:
             kill_markers.append(None)
             kill_pulses.append(None)
+            interceptor_traces.append(None)
             continue
         row, col = ser.kill_point
         if ser.kill_type == "ad":
@@ -322,6 +357,19 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
                 zorder=6,
             )
             pulse_color = INTERCEPTOR_KILL_COLOR
+        elif ser.kill_type == "ad_target":
+            marker = ax.scatter(
+                col,
+                row,
+                color=TARGET_KILL_COLOR,
+                marker=TARGET_KILL_MARKER,
+                s=150,
+                linewidths=1.2,
+                edgecolors=TARGET_KILL_EDGE,
+                alpha=0.0,
+                zorder=6,
+            )
+            pulse_color = TARGET_KILL_COLOR
         else:
             marker = ax.scatter(
                 col,
@@ -347,11 +395,56 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
         )
         ax.add_patch(pulse)
         kill_pulses.append(pulse)
-    time_text = ax.text(0.01, 0.02, "t=0.0", transform=ax.transAxes)
+        if ser.kill_type == "interceptor" and ser.destroyed_time is not None:
+            marker = ax.scatter(
+                interceptor_origin[1],
+                interceptor_origin[0],
+                color=INTERCEPTOR_KILL_COLOR,
+                marker="^",
+                s=70,
+                alpha=0.0,
+                zorder=7,
+                linewidths=1.0,
+                edgecolors="black",
+            )
+            track = ax.plot([], [], color=INTERCEPTOR_KILL_COLOR, linewidth=1.5, alpha=0.0)[0]
+            start_time = max(0.0, ser.destroyed_time - INTERCEPTOR_VISUAL_DURATION)
+            interceptor_traces.append(
+                {
+                    "marker": marker,
+                    "track": track,
+                    "start": start_time,
+                    "end": ser.destroyed_time,
+                    "kill_point": ser.kill_point,
+                    "origin": interceptor_origin,
+                }
+            )
+        else:
+            interceptor_traces.append(None)
+    status_text = ax.text(
+        0.01,
+        0.02,
+        "",
+        transform=ax.transAxes,
+        fontsize=9,
+        va="bottom",
+        ha="left",
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+    )
 
     def _update(frame_idx: int):
         current_time = frame_idx * time_step
-        time_text.set_text(f"t={current_time:.1f}")
+        counts = _status_counts(series, current_time)
+        status_text.set_text(
+            "t={time:.1f}s\nTargets destroyed: {targets}\nAD destroys: {ad}\n"
+            "Intercepted: {intercepts}\nActive drones: {active}".format(
+                time=current_time,
+                targets=counts["targets"],
+                ad=counts["ad"],
+                intercepts=counts["interceptor"],
+                active=counts["active"],
+            )
+        )
         for idx, ser in enumerate(series):
             pos = _position_at(ser, current_time)
             drone_markers[idx].set_offsets([[pos[1], pos[0]]])
@@ -385,6 +478,32 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
             elif pulse is not None:
                 pulse.set_alpha(0.0)
                 pulse.set_radius(0.0)
+            trace = interceptor_traces[idx]
+            if trace is not None:
+                marker_artist = trace["marker"]
+                track_artist = trace["track"]
+                start = trace["start"]
+                end = trace["end"]
+                origin = trace["origin"]
+                kill_point = trace["kill_point"]
+                if current_time < start:
+                    marker_artist.set_alpha(0.0)
+                    track_artist.set_alpha(0.0)
+                    track_artist.set_data([], [])
+                elif current_time >= end:
+                    marker_artist.set_alpha(0.0)
+                    track_artist.set_alpha(0.0)
+                    track_artist.set_data([], [])
+                else:
+                    duration = max(end - start, 1e-3)
+                    progress = (current_time - start) / duration
+                    eased = min(max(progress, 0.0), 1.0) ** 0.6
+                    row = origin[0] + (kill_point[0] - origin[0]) * eased
+                    col = origin[1] + (kill_point[1] - origin[1]) * eased
+                    marker_artist.set_alpha(1.0)
+                    marker_artist.set_offsets([[col, row]])
+                    track_artist.set_data([origin[1], col], [origin[0], row])
+                    track_artist.set_alpha(0.7)
         for data in ad_arrows:
             orientation = _orientation_from_events(data["base"], data["events"], current_time)
             end_col = data["col"] + arrow_length * math.cos(orientation)
@@ -394,10 +513,15 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
             drone_markers
             + path_lines
             + [data["arrow"] for data in ad_arrows]
-            + [time_text]
+            + [status_text]
         )
         artists.extend(marker for marker in kill_markers if marker is not None)
         artists.extend(pulse for pulse in kill_pulses if pulse is not None)
+        for trace in interceptor_traces:
+            if trace is None:
+                continue
+            artists.append(trace["marker"])
+            artists.append(trace["track"])
         return artists
 
     anim = animation.FuncAnimation(

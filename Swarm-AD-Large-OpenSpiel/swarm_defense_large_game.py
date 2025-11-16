@@ -123,6 +123,7 @@ class ADUnit:
     col: float
     alive: bool = True
     destroyed_by: Optional[str] = None
+    orientation: float = math.pi / 2
     intercept_log: List[Tuple[int, Tuple[float, float], float]] = field(default_factory=list)
 
 
@@ -681,7 +682,6 @@ class SwarmDefenseLargeState(pyspiel.State):
             probability=probability,
             hit_point=entry_point,
             intercept_time=intercept_time,
-            direction=direction,
         )
         self._ad_units[ad_idx].orientation = direction
         self._record_orientation_event(ad_idx, intercept_time, direction)
@@ -749,7 +749,6 @@ class SwarmDefenseLargeState(pyspiel.State):
             plan.destroyed_by = f"ad:{intercept.ad_idx}"
             plan.intercepts.append((intercept.ad_idx, intercept.hit_point, intercept.intercept_time))
             ad_unit.intercept_log.append((intercept.drone_idx, intercept.hit_point, intercept.intercept_time))
-        ad_unit.orientation = intercept.direction
         self._next_ad_resolution_index += 1
         if self._next_ad_resolution_index >= len(self._pending_ad_targets):
             self._pending_ad_targets.clear()
@@ -984,5 +983,4 @@ __all__ = [
     "ARENA_WIDTH",
     "ARENA_HEIGHT",
     "AD_COVERAGE_RADIUS",
-    "AD_FOV_DEGREES",
 ]
