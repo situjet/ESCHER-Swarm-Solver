@@ -30,7 +30,7 @@ from ESCHER_Torch import ESCHERSolverTorch  # noqa: E402
 GAME_NAME = "swarm_defense_large_v2"
 RESULT_DIR_NAME = "swarm_defense_large_v2"
 ENCODER_VERSION = "swarm_large_snapshot_v1"
-NETWORK_LAYERS = (1024, 512, 256)
+NETWORK_LAYERS = (512, 256, 128)
 VALUE_NETWORK_LAYERS = (512, 256, 128)
 
 NUM_TARGETS = large_swarm.NUM_TARGETS
@@ -64,9 +64,9 @@ DEFAULT_CONFIG = {
     "num_traversals": 100,
     "num_val_traversals": 10,
     "num_workers": 1,
-    "batch_size_regret": 1024,
-    "batch_size_value": 256,
-    "batch_size_policy": 1024,
+    "batch_size_regret": 512,
+    "batch_size_value": 128,
+    "batch_size_policy": 512,
     "train_steps": 200,
     "learning_rate": 1e-3,
 }
