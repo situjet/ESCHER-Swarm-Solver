@@ -969,14 +969,17 @@ class ESCHERSolverTorch(policy.Policy):
 
     def _learn_regret_network(self, player: int) -> Optional[float]:
         buffer = self._regret_memories[player]
-        if len(buffer) < max(1, self._batch_size_regret):
+        if len(buffer) < 1:
             return None
         model = self._regret_train_models[player]
         optimizer = self._regret_optimizers[player]
         model.train()
         losses = []
         for _ in range(self._regret_network_train_steps):
+            # Use available samples, but at least 1, up to batch_size_regret
             batch_size = min(len(buffer), self._batch_size_regret)
+            if batch_size < 1:
+                break
             batch = buffer.sample(batch_size)
             info_states, iterations, regrets, masks = self._batch_to_tensor(
                 batch, ("info_state", "iteration", "regret", "mask"), self._train_device
@@ -988,6 +991,8 @@ class ESCHERSolverTorch(policy.Policy):
             loss.backward()
             optimizer.step()
             losses.append(loss.detach().cpu().item())
+        if len(losses) == 0:
+            return None
         self._regret_networks[player].load_state_dict(model.state_dict())
         return float(np.mean(losses))
 
