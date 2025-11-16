@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from swarm_defense_large_game import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "Visualizer"
 OUTPUT_PATH = OUTPUT_DIR / "swarm_defense_large_animation.gif"
+SNAPSHOT_OUTPUT_PATH = OUTPUT_DIR / "swarm_large_snapshot.json"
 DRONE_SPEED = 1.0
 AD_KILL_COLOR = "#FF3B30"
 AD_KILL_EDGE = "black"
@@ -31,7 +33,7 @@ INTERCEPTOR_KILL_COLOR = "#0bc5ea"
 AD_TARGET_KILL_COLOR = "#2E8B57"
 AD_ROTATION_ARROW_COLOR = "#1f4c94"
 INTERCEPTOR_ORIGIN = (30.0, 0.0)
-INTERCEPTOR_VISUAL_DURATION = 3.0
+INTERCEPTOR_VISUAL_DURATION = 6.0
 TARGET_KILL_COLOR = "#F1C40F"
 TARGET_KILL_EDGE = "#7D6608"
 TARGET_KILL_MARKER = "P"
@@ -82,6 +84,52 @@ def _generate_abstract_snapshot(seed: int) -> Dict[str, object]:
             action = rng.choice(state.legal_actions())
         state.apply_action(action)
     return state.snapshot()
+
+
+def _write_snapshot(snapshot: Dict[str, object], output_path: Path) -> Path:
+    """Persist the large-game snapshot for downstream consumers (e.g., WinTAK)."""
+
+    def _normalize_targets(raw_targets: Sequence[object]) -> List[Dict[str, float]]:
+        normalized: List[Dict[str, float]] = []
+        for target in raw_targets:
+            if hasattr(target, "row"):
+                normalized.append(
+                    {
+                        "row": float(getattr(target, "row")),
+                        "col": float(getattr(target, "col")),
+                        "value": float(getattr(target, "value")),
+                    }
+                )
+            elif isinstance(target, dict):
+                normalized.append(
+                    {
+                        "row": float(target.get("row", 0.0)),
+                        "col": float(target.get("col", 0.0)),
+                        "value": float(target.get("value", 0.0)),
+                    }
+                )
+            elif isinstance(target, (list, tuple)) and len(target) >= 3:
+                row, col, value = target[:3]
+                normalized.append(
+                    {
+                        "row": float(row),
+                        "col": float(col),
+                        "value": float(value),
+                    }
+                )
+        return normalized
+
+    safe_snapshot = dict(snapshot)
+    safe_snapshot["targets"] = _normalize_targets(snapshot.get("targets", ()))
+    safe_snapshot["target_destroyed"] = list(snapshot.get("target_destroyed", ()))
+    safe_snapshot["ad_units"] = [dict(unit) for unit in snapshot.get("ad_units", ())]
+    safe_snapshot["drones"] = [dict(drone) for drone in snapshot.get("drones", ())]
+    safe_snapshot["returns"] = list(snapshot.get("returns", ()))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(safe_snapshot, handle, indent=2, sort_keys=True)
+    return output_path
 
 
 def _tot_color(tot: float) -> str:
@@ -183,6 +231,30 @@ def _prepare_drone_series(snapshot: Dict[str, object]) -> List[DroneSeries]:
     return series
 
 
+def _target_events(snapshot: Dict[str, object]) -> List[Dict[str, object]]:
+    targets: Sequence[object] = snapshot.get("targets", ())  # type: ignore[assignment]
+    destroyed_flags: Sequence[bool] = snapshot.get("target_destroyed", ())  # type: ignore[assignment]
+    drones: Sequence[Dict[str, object]] = snapshot.get("drones", ())  # type: ignore[assignment]
+    events: List[Dict[str, object]] = []
+    for idx, target in enumerate(targets):
+        destroyed_time: Optional[float] = None
+        if idx < len(destroyed_flags) and destroyed_flags[idx]:
+            arrival_times = [
+                float(drone.get("arrival_time") or 0.0)
+                for drone in drones
+                if drone.get("strike_success") and drone.get("target_idx") == idx
+            ]
+            if arrival_times:
+                destroyed_time = min(arrival_times)
+        events.append({
+            "row": getattr(target, "row", 0.0),
+            "col": getattr(target, "col", 0.0),
+            "value": getattr(target, "value", 0.0),
+            "destroyed_time": destroyed_time,
+        })
+    return events
+
+
 def _prefix_path(drone: DroneSeries, t: float) -> List[Tuple[float, float]]:
     points = [drone.entry]
     prev_time = drone.start_time
@@ -233,19 +305,27 @@ def _max_time(series: Sequence[DroneSeries]) -> float:
     return max_t + 2.0
 
 
-def _status_counts(series: Sequence[DroneSeries], t: float) -> Dict[str, int]:
+def _status_counts(
+    series: Sequence[DroneSeries],
+    target_events: Sequence[Dict[str, object]],
+    t: float,
+) -> Dict[str, int]:
     counts = {
         "targets": 0,
         "ad": 0,
         "interceptor": 0,
         "active": 0,
     }
+    counts["targets"] = sum(
+        1
+        for event in target_events
+        if event.get("destroyed_time") is not None
+        and t >= float(event["destroyed_time"])
+    )
     for drone in series:
         resolved = drone.destroyed_time is not None and t >= drone.destroyed_time
         if resolved and drone.kill_type:
-            if drone.kill_type == "ad_target":
-                counts["targets"] += 1
-            elif drone.kill_type == "ad":
+            if drone.kill_type == "ad":
                 counts["ad"] += 1
             elif drone.kill_type == "interceptor":
                 counts["interceptor"] += 1
@@ -270,11 +350,10 @@ def _orientation_from_events(
     return orientation
 
 
-def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path: Path, *, time_step: float, fps: int) -> None:
-    snapshot = state.snapshot()
+def _build_animation(snapshot: Dict[str, object], output_path: Path, *, time_step: float, fps: int) -> None:
     series = _prepare_drone_series(snapshot)
     ad_units: Sequence[Dict[str, object]] = snapshot["ad_units"]  # type: ignore[assignment]
-    targets: Sequence[Dict[str, object]] = snapshot["targets"]  # type: ignore[assignment]
+    target_events = _target_events(snapshot)
     max_t = _max_time(series)
     frames = int(math.ceil(max_t / time_step)) + 1
 
@@ -286,9 +365,24 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
     ax.set_ylabel("Rows")
     ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.4)
 
-    for idx, target in enumerate(targets):
-        ax.scatter(target.col, target.row, s=220, color="tab:green", marker="o")
-        ax.text(target.col + 0.3, target.row, f"T{idx}\nV={target.value:.0f}")
+    target_base_markers = []
+    target_kill_markers = []
+    for idx, target in enumerate(target_events):
+        base = ax.scatter(target["col"], target["row"], s=220, color="tab:green", marker="o", zorder=3)
+        target_base_markers.append(base)
+        kill = ax.scatter(
+            target["col"],
+            target["row"],
+            s=260,
+            marker=TARGET_KILL_MARKER,
+            color=TARGET_KILL_COLOR,
+            edgecolors=TARGET_KILL_EDGE,
+            linewidths=1.6,
+            alpha=0.0,
+            zorder=6,
+        )
+        target_kill_markers.append(kill)
+        ax.text(target["col"] + 0.3, target["row"], f"T{idx}\nV={target['value']:.0f}")
 
     arrow_length = AD_COVERAGE_RADIUS * 0.95
     ad_arrows = []
@@ -434,7 +528,7 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
 
     def _update(frame_idx: int):
         current_time = frame_idx * time_step
-        counts = _status_counts(series, current_time)
+        counts = _status_counts(series, target_events, current_time)
         status_text.set_text(
             "t={time:.1f}s\nTargets destroyed: {targets}\nAD destroys: {ad}\n"
             "Intercepted: {intercepts}\nActive drones: {active}".format(
@@ -445,6 +539,11 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
                 active=counts["active"],
             )
         )
+        for idx, target in enumerate(target_events):
+            destroyed_time = target.get("destroyed_time")
+            killed = destroyed_time is not None and current_time >= float(destroyed_time)
+            target_base_markers[idx].set_alpha(0.0 if killed else 1.0)
+            target_kill_markers[idx].set_alpha(1.0 if killed else 0.0)
         for idx, ser in enumerate(series):
             pos = _position_at(ser, current_time)
             drone_markers[idx].set_offsets([[pos[1], pos[0]]])
@@ -515,6 +614,8 @@ def _build_animation(state: policy_transfer.SwarmDefenseLargeState, output_path:
             + [data["arrow"] for data in ad_arrows]
             + [status_text]
         )
+        artists.extend(target_base_markers)
+        artists.extend(target_kill_markers)
         artists.extend(marker for marker in kill_markers if marker is not None)
         artists.extend(pulse for pulse in kill_pulses if pulse is not None)
         for trace in interceptor_traces:
@@ -542,6 +643,12 @@ def main() -> None:
     parser.add_argument("--time-step", type=float, default=0.25, help="Simulation timestep in seconds")
     parser.add_argument("--fps", type=int, default=12, help="Frames per second for the GIF")
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="Output animation path")
+    parser.add_argument(
+        "--snapshot-output",
+        type=Path,
+        default=SNAPSHOT_OUTPUT_PATH,
+        help="Where to store the JSON snapshot for WinTAK/CoT export",
+    )
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 2**31 - 1)
@@ -549,9 +656,12 @@ def main() -> None:
     abstract_snapshot = _generate_abstract_snapshot(seed)
     blueprint = build_blueprint_from_small_snapshot(abstract_snapshot, rng=rng)
     final_state = rollout_blueprint_episode(blueprint, seed=seed)
-    _build_animation(final_state, args.output, time_step=args.time_step, fps=args.fps)
+    snapshot = final_state.snapshot()
+    snapshot_path = _write_snapshot(snapshot, args.snapshot_output)
+    _build_animation(snapshot, args.output, time_step=args.time_step, fps=args.fps)
     print("Animation complete.")
     print(f"Seed: {seed}")
+    print(f"Snapshot saved to: {snapshot_path}")
     print(f"Animation saved to: {args.output}")
 
 

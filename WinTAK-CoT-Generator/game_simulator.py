@@ -1,7 +1,5 @@
 """Game state simulator for Swarm Defense visualization."""
-
-from __future__ import annotations
-
+import json
 import math
 import random
 import sys
@@ -14,28 +12,107 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT / "Swarm-AD-Large-OpenSpiel"))
 
-try:
-    import pyspiel
-    import policy_transfer
-    from swarm_defense_large_game import (
-        AD_COVERAGE_RADIUS,
-        ARENA_HEIGHT,
-        ARENA_WIDTH,
-        DRONE_SPEED,
-        INTERCEPTOR_SPEED_MULTIPLIER,
-        LARGE_TOT_CHOICES,
+try:  # Shared constants independent of pyspiel
+    import large_game_constants as lgc  # type: ignore
+except ImportError:  # pragma: no cover - fallback
+    lgc = None  # type: ignore
+
+try:  # Geometry helpers for synthetic fallback generation
+    from blueprint_midpoints import (  # type: ignore
+        BlueprintContext,
+        MIDPOINT_STRATEGIES,
+        blueprint_midpoints,
     )
-except ImportError:
-    # Fallback if imports fail
+except ImportError:  # pragma: no cover - minimal defaults
+    BlueprintContext = None  # type: ignore
+    MIDPOINT_STRATEGIES = ("direct", "fan_left", "fan_right", "loiter")
+    blueprint_midpoints = None  # type: ignore
+
+try:
+    from pathfinding import (  # type: ignore
+        Bounds,
+        CircleObstacle,
+        rrt_path,
+        sample_path,
+        smooth_path,
+    )
+except ImportError:  # pragma: no cover - fallback guards
+    Bounds = CircleObstacle = None  # type: ignore
+    rrt_path = sample_path = smooth_path = None  # type: ignore
+
+if lgc is not None:
+    ARENA_WIDTH = lgc.ARENA_WIDTH
+    ARENA_HEIGHT = lgc.ARENA_HEIGHT
+    AD_COVERAGE_RADIUS = lgc.AD_COVERAGE_RADIUS
+    LARGE_TOT_CHOICES = lgc.LARGE_TOT_CHOICES
+    DRONE_SPEED = lgc.DRONE_SPEED
+    INTERCEPTOR_SPEED_MULTIPLIER = lgc.INTERCEPTOR_SPEED_MULTIPLIER
+    NUM_TARGETS = lgc.NUM_TARGETS
+    NUM_AD_UNITS = lgc.NUM_AD_UNITS
+    NUM_ATTACKING_DRONES = lgc.NUM_ATTACKING_DRONES
+    NUM_INTERCEPTORS = lgc.NUM_INTERCEPTORS
+    ENTRY_POINTS = lgc.ENTRY_POINTS
+    TARGET_CANDIDATE_CELLS = lgc.TARGET_CANDIDATE_CELLS
+    TARGET_VALUE_OPTIONS = lgc.TARGET_VALUE_OPTIONS
+    AD_POSITION_CANDIDATES = lgc.AD_POSITION_CANDIDATES
+    DRONE_VS_TARGET_KILL_PROB = lgc.DRONE_VS_TARGET_KILL_PROB
+    DRONE_VS_AD_KILL_PROB = lgc.DRONE_VS_AD_KILL_PROB
+    AD_KILL_RATE = lgc.AD_KILL_RATE
+    RRT_TIME_LIMIT_SEC = lgc.RRT_TIME_LIMIT_SEC
+else:  # pragma: no cover - legacy defaults
     ARENA_WIDTH = 32.0
     ARENA_HEIGHT = 32.0
     AD_COVERAGE_RADIUS = 5.5
     LARGE_TOT_CHOICES = (0.0, 1.5, 3.0, 4.5)
     DRONE_SPEED = 1.0
     INTERCEPTOR_SPEED_MULTIPLIER = 2.0
+    NUM_TARGETS = 3
+    NUM_AD_UNITS = 2
+    NUM_ATTACKING_DRONES = 40
+    NUM_INTERCEPTORS = NUM_ATTACKING_DRONES // 2
+    ENTRY_POINTS = [(0.0, lane + 0.5) for lane in range(24)]
+    TARGET_CANDIDATE_CELLS = [
+        (row, col)
+        for row in [12.0, 14.5, 17.0, 19.5, 22.0]
+        for col in [3.0, 7.0, 11.0, 15.0, 19.0]
+    ]
+    TARGET_VALUE_OPTIONS = (10.0, 25.0, 60.0)
+    AD_POSITION_CANDIDATES = [
+        (row, col)
+        for row in [13.0, 15.5, 18.0, 20.5]
+        for col in [2.5, 6.5, 10.5, 14.5, 18.5]
+    ]
+    DRONE_VS_TARGET_KILL_PROB = 0.7
+    DRONE_VS_AD_KILL_PROB = 0.8
+    AD_KILL_RATE = 0.05
+    RRT_TIME_LIMIT_SEC = 0.03
 
-INTERCEPT_BACKLINE_ROW = ARENA_HEIGHT + 2.0
-INTERCEPTOR_SPEED = max(DRONE_SPEED * INTERCEPTOR_SPEED_MULTIPLIER, 1.0)
+try:
+    import pyspiel
+    import policy_transfer
+    from swarm_defense_large_game import (
+        AD_COVERAGE_RADIUS as _AD_COV_RADIUS_SRC,
+        ARENA_HEIGHT as _ARENA_HEIGHT_SRC,
+        ARENA_WIDTH as _ARENA_WIDTH_SRC,
+        DRONE_SPEED as _DRONE_SPEED_SRC,
+        INTERCEPTOR_SPEED_MULTIPLIER as _INT_SPEED_MULT_SRC,
+        LARGE_TOT_CHOICES as _LARGE_TOT_SRC,
+    )
+    # Ensure constants align with authoritative values when imports succeed.
+    ARENA_WIDTH = _ARENA_WIDTH_SRC
+    ARENA_HEIGHT = _ARENA_HEIGHT_SRC
+    AD_COVERAGE_RADIUS = _AD_COV_RADIUS_SRC
+    LARGE_TOT_CHOICES = _LARGE_TOT_SRC
+    DRONE_SPEED = _DRONE_SPEED_SRC
+    INTERCEPTOR_SPEED_MULTIPLIER = _INT_SPEED_MULT_SRC
+    INTERCEPTOR_SPEED = max(DRONE_SPEED * INTERCEPTOR_SPEED_MULTIPLIER, 1.0) * 2.0
+except ImportError:
+    pyspiel = None  # type: ignore
+    policy_transfer = None  # type: ignore
+
+INTERCEPT_ORIGIN_ROW = ARENA_HEIGHT + 2.0
+INTERCEPT_ORIGIN_COL = ARENA_WIDTH / 2.0
+INTERCEPTOR_SPEED = max(DRONE_SPEED * INTERCEPTOR_SPEED_MULTIPLIER, 1.0) * 2.0
 AD_FLASH_WINDOW = 1.2  # seconds of flashing connection prior to intercept
 
 
@@ -92,6 +169,8 @@ class ADUnitState:
     engaged_drones: List[int] = field(default_factory=list)
     alive: bool = True
     destroyed_by: Optional[str] = None
+    orientation_events: List[Tuple[float, float]] = field(default_factory=list)
+    destroy_time: Optional[float] = None
 
 
 @dataclass
@@ -128,6 +207,21 @@ class GameSnapshot:
     ad_units: List[ADUnitState]
     targets: List[TargetState]
     engagements: List[ADEngagement]
+
+
+def _orientation_from_events(
+    base_orientation: float,
+    events: Sequence[Tuple[float, float]],
+    t: float,
+) -> float:
+    """Return the most recent orientation update at time t."""
+
+    orientation = base_orientation
+    for event_time, direction in events:
+        if t < event_time:
+            break
+        orientation = direction
+    return orientation
 
 
 def _sample_chance_action(state, rng: random.Random) -> int:
@@ -224,8 +318,7 @@ def _build_interceptor_tracks(drones: List[DroneState]) -> List[InterceptorTrack
             continue
         if drone.kill_point is None or drone.kill_time is None:
             continue
-        entry_col = drone.path_points[0][1] if drone.path_points else drone.kill_point[1]
-        start_point = (INTERCEPT_BACKLINE_ROW, entry_col)
+        start_point = (INTERCEPT_ORIGIN_ROW, INTERCEPT_ORIGIN_COL)
         distance = math.dist(start_point, drone.kill_point)
         flight_time = max(distance / INTERCEPTOR_SPEED, 0.5)
         start_time = max(0.0, drone.kill_time - flight_time)
@@ -254,18 +347,46 @@ def _compute_target_destroy_times(drones: List[DroneState]) -> Dict[int, float]:
     return destroy_times
 
 
-def _convert_snapshot_to_game_states(game_state_obj, time_step: float = 0.25) -> List[GameSnapshot]:
+def _load_snapshot_from_path(path: Path) -> Optional[Dict[str, object]]:
+    """Load a serialized large-game snapshot from disk."""
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        print(f"Warning: Snapshot file not found: {path}")
+        return None
+    except json.JSONDecodeError as exc:
+        print(f"Warning: Could not parse snapshot {path}: {exc}")
+        return None
+
+    if isinstance(data, dict):
+        return data
+
+    print(f"Warning: Snapshot {path} is not a JSON object; ignoring.")
+    return None
+
+
+def _convert_snapshot_to_game_states(
+    game_state_obj,
+    time_step: float = 0.25,
+    seed: Optional[int] = None,
+    snapshot_data: Optional[Dict[str, object]] = None,
+) -> List[GameSnapshot]:
     """Convert a game state object to a sequence of GameSnapshot objects."""
 
+    if snapshot_data is not None:
+        return _parse_large_game_snapshot(snapshot_data, time_step)
+
     if game_state_obj is None:
-        return _generate_synthetic_game_states(time_step)
+        return _generate_synthetic_game_states(time_step, seed=seed)
 
     try:
         snapshot = game_state_obj.snapshot()
         return _parse_large_game_snapshot(snapshot, time_step)
     except Exception as exc:
         print(f"Warning: Could not parse game snapshot: {exc}")
-        return _generate_synthetic_game_states(time_step)
+        return _generate_synthetic_game_states(time_step, seed=seed)
 
 
 def _parse_large_game_snapshot(snapshot: Dict, time_step: float) -> List[GameSnapshot]:
@@ -325,19 +446,27 @@ def _parse_large_game_snapshot(snapshot: Dict, time_step: float) -> List[GameSna
         )
 
     ad_units_template: List[ADUnitState] = []
+    ad_final_alive: List[bool] = []
     for idx, ad_data in enumerate(ad_units_data):
         pos = tuple(ad_data["position"])
         orientation = float(ad_data.get("orientation", math.pi / 2))
-        alive = bool(ad_data.get("alive", True))
+        final_alive = bool(ad_data.get("alive", True))
+        raw_events: Sequence[Tuple[float, float]] = ad_data.get("orientation_events", [])
+        orientation_events = sorted(
+            [(float(event_time), float(direction)) for event_time, direction in raw_events],
+            key=lambda item: item[0],
+        )
         ad_units_template.append(
             ADUnitState(
                 ad_id=idx,
                 position=pos,
                 orientation=orientation,
-                alive=alive,
+                alive=True,
                 destroyed_by=ad_data.get("destroyed_by"),
+                orientation_events=orientation_events,
             )
         )
+        ad_final_alive.append(final_alive)
 
     target_destroy_times = _compute_target_destroy_times(drone_tracks)
     target_destroyed_flags = snapshot.get("target_destroyed", [])
@@ -363,6 +492,32 @@ def _parse_large_game_snapshot(snapshot: Dict, time_step: float) -> List[GameSna
             )
         )
 
+    target_count = len(targets_template)
+    ad_destroy_events: Dict[int, Tuple[float, str]] = {}
+    for track in drone_tracks:
+        if not track.strike_success or not track.path_times:
+            continue
+        if track.target_idx < target_count:
+            continue
+        ad_idx = track.target_idx - target_count
+        if ad_idx < 0 or ad_idx >= len(ad_units_template):
+            continue
+        destroy_time = track.path_times[-1]
+        killer = f"drone:{track.drone_id}"
+        previous = ad_destroy_events.get(ad_idx)
+        if previous is None or destroy_time < previous[0]:
+            ad_destroy_events[ad_idx] = (destroy_time, killer)
+
+    for ad_state, final_alive in zip(ad_units_template, ad_final_alive):
+        schedule = ad_destroy_events.get(ad_state.ad_id)
+        if schedule is not None:
+            destroy_time, killer = schedule
+            ad_state.destroy_time = destroy_time
+            if not ad_state.destroyed_by:
+                ad_state.destroyed_by = killer
+        elif not final_alive:
+            ad_state.destroy_time = 0.0
+
     interceptor_tracks = _build_interceptor_tracks(drone_tracks)
 
     max_time = 0.0
@@ -378,17 +533,26 @@ def _parse_large_game_snapshot(snapshot: Dict, time_step: float) -> List[GameSna
     while t <= max_time:
         current_drones: List[DroneState] = []
         engagements: List[ADEngagement] = []
-        snapshot_ad_units: List[ADUnitState] = [
-            ADUnitState(
-                ad_id=ad.ad_id,
-                position=ad.position,
-                orientation=ad.orientation,
-                coverage_radius=ad.coverage_radius,
-                alive=ad.alive,
-                destroyed_by=ad.destroyed_by,
+        snapshot_ad_units: List[ADUnitState] = []
+        for ad in ad_units_template:
+            effective_orientation = _orientation_from_events(
+                ad.orientation,
+                ad.orientation_events,
+                t,
             )
-            for ad in ad_units_template
-        ]
+            alive = ad.destroy_time is None or t < ad.destroy_time
+            snapshot_ad_units.append(
+                ADUnitState(
+                    ad_id=ad.ad_id,
+                    position=ad.position,
+                    orientation=effective_orientation,
+                    coverage_radius=ad.coverage_radius,
+                    alive=alive,
+                    destroyed_by=ad.destroyed_by,
+                    orientation_events=ad.orientation_events,
+                    destroy_time=ad.destroy_time,
+                )
+            )
 
         for track in drone_tracks:
             position = _position_on_path(track.path_points, track.path_times, t)
@@ -427,6 +591,8 @@ def _parse_large_game_snapshot(snapshot: Dict, time_step: float) -> List[GameSna
                 if t > intercept_time or t < intercept_time - AD_FLASH_WINDOW:
                     continue
                 if ad_idx >= len(snapshot_ad_units):
+                    continue
+                if not snapshot_ad_units[ad_idx].alive:
                     continue
                 snapshot_ad_units[ad_idx].engaged_drones.append(track.drone_id)
                 engagements.append(
@@ -486,10 +652,14 @@ def _parse_large_game_snapshot(snapshot: Dict, time_step: float) -> List[GameSna
     return snapshots
 
 
-def _generate_synthetic_game_states(time_step: float = 0.25) -> List[GameSnapshot]:
+def _generate_synthetic_game_states(
+    time_step: float = 0.25,
+    seed: Optional[int] = None,
+) -> List[GameSnapshot]:
     """Generate synthetic game states for testing when real game data unavailable."""
 
     print("Generating synthetic game states for testing...")
+    rng = random.Random(seed)
     targets_template = [
         TargetState(0, (20.0, 8.0), 40.0, 0.0),
         TargetState(1, (22.0, 16.0), 25.0, 0.0),
@@ -502,7 +672,7 @@ def _generate_synthetic_game_states(time_step: float = 0.25) -> List[GameSnapsho
 
     drones: List[DroneState] = []
     for i in range(12):
-        entry_col = (i * 2.5) % 24
+        entry_col = (rng.uniform(0.0, 1.0) * ARENA_WIDTH) if seed is not None else (i * 2.5) % 24
         entry = (0.0, entry_col)
         target_idx = i % len(targets_template)
         target_pos = targets_template[target_idx].position
@@ -516,7 +686,13 @@ def _generate_synthetic_game_states(time_step: float = 0.25) -> List[GameSnapsho
         kill_time = None
         intercepts: List[Tuple[int, Tuple[float, float], float]] = []
         strike_success = i % 4 == 0
-        if i % 5 == 0:
+
+        # Ensure at least one clear interceptor engagement for WinTAK practice.
+        if i == 0:
+            destroyed_by = "interceptor"
+            kill_point = target_pos
+            kill_time = tot + travel_time * 0.65
+        elif i % 5 == 0:
             destroyed_by = "interceptor"
             kill_point = target_pos
             kill_time = tot + travel_time * 0.6
@@ -577,8 +753,28 @@ def _generate_synthetic_game_states(time_step: float = 0.25) -> List[GameSnapsho
     return _parse_large_game_snapshot(synthetic_snapshot, time_step)
 
 
-def generate_game_sequence(seed: int, time_step: float = 0.25) -> List[GameSnapshot]:
+def generate_game_sequence(
+    seed: int,
+    time_step: float = 0.25,
+    snapshot_path: Optional[Path] = None,
+) -> List[GameSnapshot]:
     """Generate a complete sequence of game states."""
 
+    snapshot_data: Optional[Dict[str, object]] = None
+    if snapshot_path is not None:
+        resolved_path = Path(snapshot_path)
+        snapshot_data = _load_snapshot_from_path(resolved_path)
+        if snapshot_data is not None:
+            print(f"Using recorded snapshot from {resolved_path}")
+            return _convert_snapshot_to_game_states(
+                None,
+                time_step,
+                seed=seed,
+                snapshot_data=snapshot_data,
+            )
+        print(f"Warning: Failed to load snapshot at {resolved_path}; falling back to simulation.")
+
     game_state = _build_large_game_state(seed)
-    return _convert_snapshot_to_game_states(game_state, time_step)
+    if game_state is None:
+        return _generate_synthetic_game_states(time_step, seed=seed)
+    return _convert_snapshot_to_game_states(game_state, time_step, seed=seed)

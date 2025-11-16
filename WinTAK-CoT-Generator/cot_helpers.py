@@ -14,13 +14,14 @@ ARENA_WIDTH = 32.0
 ARENA_HEIGHT = 32.0
 
 # Degrees per unit for geographic mapping
-# 3x scale fan-out so icons are easier to distinguish on the map
-DEGREES_PER_UNIT = 0.0003
+# 6x scale fan-out so icons are easier to distinguish on the map
+DEGREES_PER_UNIT = 0.0006
 
 COT_XML_TEMPLATE = (
     '<event version="2.0" uid="{uid}" type="{cot_type}" time="{time}" start="{start}" stale="{stale}" how="m-g">'
     "<point lat=\"{lat:.6f}\" lon=\"{lon:.6f}\" hae=\"{hae}\" ce=\"{ce}\" le=\"{le}\"/>"
     "<detail><contact callsign=\"{callsign}\"/>"
+    "{extra_detail}"
     "<remarks>{remarks}</remarks>"
     "</detail></event>"
 )
@@ -60,6 +61,8 @@ def format_cot_event(
     ce: int = 20,
     le: int = 20,
     remarks: str = "",
+    stale_seconds: float = 120.0,
+    extra_detail: str = "",
 ) -> str:
     """
     Format a single CoT event.
@@ -80,7 +83,7 @@ def format_cot_event(
     """
     now = datetime.now(timezone.utc)
     start_time = now
-    stale_time = now + timedelta(minutes=2)
+    stale_time = now + timedelta(seconds=max(stale_seconds, 0.1))
     return COT_XML_TEMPLATE.format(
         uid=uid,
         cot_type=cot_type,
@@ -94,6 +97,7 @@ def format_cot_event(
         le=le,
         callsign=callsign,
         remarks=remarks,
+        extra_detail=extra_detail,
     )
 
 
@@ -105,12 +109,31 @@ def wrap_xml(body: str) -> bytes:
 
 # CoT type mappings for different entity types
 COT_TYPES = {
-    "drone_active": "a-h-A-M-F",  # REDFOR swarm aircraft
+    "drone_active": "a-h-A-M-F",  # REDFOR swarm aircraft icon
     "interceptor": "a-f-A-M-H",  # BLUFOR interceptor
-    "ad_unit": "a-f-A-M-D",  # BLUFOR air defense node
+    "ad_unit": "a-f-G-U-C",  # BLUFOR ground-based air defense
     "target": "a-n-A-M-F",  # GREEN/INDFOR target markers
-    "ad_engagement": "b-m-p-s-l",  # Line/engagement indicator
+    "ad_engagement": "b-m-p-s-p-l",  # Engagement line indicator
+    "ad_fov": "b-m-p-s-p-r",  # Sensor/radar range fan
+    "delete": "t-x-d-d",  # TAK delete directive
 }
+
+
+def format_delete_event(uid: str, remarks: str = "Removed") -> str:
+    """Create a CoT delete directive for a specific UID."""
+
+    return format_cot_event(
+        uid=uid,
+        callsign=uid,
+        cot_type=COT_TYPES["delete"],
+        lat=0.0,
+        lon=0.0,
+        hae=0,
+        ce=999999,
+        le=999999,
+        remarks=remarks,
+        stale_seconds=1.0,
+    )
 
 
 # Color coding for remarks (for context, not directly used in CoT)

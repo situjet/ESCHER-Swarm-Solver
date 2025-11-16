@@ -57,7 +57,7 @@ Generate an animation (GIF) that highlights AD field-of-view slews and drone tim
 python Swarm-AD-Large-OpenSpiel/demo_animation.py --seed 1337 --time-step 0.25 --fps 12
 ```
 
-The animation is stored at `Visualizer/swarm_defense_large_animation.gif` by default.
+The animation is stored at `Visualizer/swarm_defense_large_animation.gif` by default, and each run now also writes `Visualizer/swarm_large_snapshot.json`. The WinTAK CoT generator consumes this snapshot to mirror the exact episode; pass `--snapshot-output /path/to/file.json` to rename or relocate the export.
 
 ## Notes for ESCHER integration
 
