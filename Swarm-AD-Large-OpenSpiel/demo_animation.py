@@ -1,28 +1,49 @@
-"""Time-stepped animation for the large Swarm Defense scenario."""
+"""Time-stepped animation for the large Swarm Defense scenario with learned policy."""
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib import animation, patches
+import numpy as np
+import torch
 import pyspiel
 
-import policy_transfer
-from policy_transfer import build_blueprint_from_small_snapshot, rollout_blueprint_episode
+# Add paths for imports
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "Swarm-AD-OpenSpiel"))
+sys.path.insert(0, str(PROJECT_ROOT / "ESCHER-Torch"))
+
+import swarm_defense_game as small_game
+from ESCHER_Torch.eschersolver import PolicyNetwork
 from swarm_defense_large_game import (
+    SwarmDefenseLargeGame,
+    SwarmDefenseLargeState,
+    Phase,
+    encode_drone_action,
     AD_COVERAGE_RADIUS,
     ARENA_HEIGHT,
     ARENA_WIDTH,
     LARGE_TOT_CHOICES,
+    NUM_ATTACKING_DRONES,
+    NUM_INTERCEPTORS,
+    TARGET_POSITION_ACTION_BASE,
+    TARGET_VALUE_ACTION_BASE,
+    AD_ACTION_BASE,
+    DRONE_ACTION_BASE,
+    INTERCEPT_ACTION_BASE,
+    TARGET_CANDIDATE_CELLS,
+    ENTRY_POINTS,
 )
+from large_game_constants import ENTRY_LANES
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "Visualizer"
 OUTPUT_PATH = OUTPUT_DIR / "swarm_defense_large_animation.gif"
 SNAPSHOT_OUTPUT_PATH = OUTPUT_DIR / "swarm_large_snapshot.json"
@@ -61,29 +82,246 @@ class DroneSeries:
     kill_type: Optional[str] = None
 
 
-def _sample_chance_action(state: pyspiel.State, rng: random.Random) -> int:
-    outcomes = state.chance_outcomes()
-    pick = rng.random()
-    cumulative = 0.0
-    for action, probability in outcomes:
-        cumulative += probability
-        if pick <= cumulative:
-            return action
-    return outcomes[-1][0]
+def load_policy_network(checkpoint_path: Path) -> Tuple[torch.nn.Module, Dict]:
+    """Load trained policy network and metadata."""
+    policy_path = checkpoint_path / "policy.pt"
+    
+    if not policy_path.exists():
+        raise FileNotFoundError(f"Policy checkpoint not found at {policy_path}")
+    
+    # Use the small game config directly
+    game = small_game.SwarmDefenseGame()
+    initial_state = game.new_initial_state()
+    state_size = len(initial_state.information_state_tensor(0))
+    num_actions = game.num_distinct_actions()
+    
+    # Load metadata if available (optional)
+    metadata = {}
+    metadata_path = checkpoint_path / "metadata.pt"
+    if metadata_path.exists():
+        metadata = torch.load(metadata_path, map_location='cpu')
+    
+    # Build game config from small_game module
+    game_config = {
+        'GRID_SIZE': small_game.GRID_SIZE,
+        'NUM_TARGETS': small_game.NUM_TARGETS,
+        'NUM_AD_UNITS': small_game.NUM_AD_UNITS,
+        'NUM_ATTACKING_DRONES': small_game.NUM_ATTACKING_DRONES,
+        'NUM_INTERCEPTORS': small_game.NUM_INTERCEPTORS,
+        'state_tensor_size': state_size,
+        'num_distinct_actions': num_actions,
+    }
+    metadata['game_config'] = game_config
+    
+    # Create policy network matching the trained architecture
+    hidden_layers = (256, 128)
+    policy_net = PolicyNetwork(state_size, hidden_layers, num_actions)
+    policy_net.load_state_dict(torch.load(policy_path, map_location='cpu'))
+    policy_net.eval()
+    
+    return policy_net, metadata
 
 
-def _generate_abstract_snapshot(seed: int) -> Dict[str, object]:
+def get_policy_action(policy_net: torch.nn.Module, state: pyspiel.State, 
+                     legal_actions: List[int], num_actions: int) -> int:
+    """Get action from policy network for the given state."""
+    if not legal_actions:
+        raise ValueError("No legal actions available")
+    
+    # Get state tensor
+    state_tensor = torch.FloatTensor(state.information_state_tensor(state.current_player()))
+    
+    # Create mask for legal actions (1.0 for legal, 0.0 for illegal)
+    mask = torch.zeros(num_actions, dtype=torch.float32)
+    mask[legal_actions] = 1.0
+    
+    with torch.no_grad():
+        probs = policy_net(state_tensor.unsqueeze(0), mask.unsqueeze(0)).squeeze(0)
+    
+    # Sample from policy
+    action = torch.multinomial(probs, 1).item()
+    
+    return action
+
+
+def run_small_game_with_policy(policy_net: torch.nn.Module, seed: int) -> Dict[str, object]:
+    """Run the small grid game using the learned policy."""
     rng = random.Random(seed)
-    abstract_game = policy_transfer.abstract_game.SwarmDefenseGame()
-    state = abstract_game.new_initial_state()
+    game = small_game.SwarmDefenseGame()
+    state = game.new_initial_state()
+    num_actions = game.num_distinct_actions()
+    
     while not state.is_terminal():
         player = state.current_player()
+        
         if player == pyspiel.PlayerId.CHANCE:
-            action = _sample_chance_action(state, rng)
+            # Sample chance node
+            outcomes = state.chance_outcomes()
+            pick = rng.random()
+            cumulative = 0.0
+            for action, prob in outcomes:
+                cumulative += prob
+                if pick <= cumulative:
+                    state.apply_action(action)
+                    break
         else:
-            action = rng.choice(state.legal_actions())
-        state.apply_action(action)
+            # Use policy for player decisions
+            legal_actions = state.legal_actions()
+            action = get_policy_action(policy_net, state, legal_actions, num_actions)
+            state.apply_action(action)
+    
     return state.snapshot()
+
+
+def grid_to_continuous(row: int, col: int) -> Tuple[float, float]:
+    """Map discrete grid position to continuous arena position (cell center)."""
+    grid_size = small_game.GRID_SIZE
+    cell_height = ARENA_HEIGHT / grid_size
+    cell_width = ARENA_WIDTH / grid_size
+    
+    # Place at center of grid cell
+    continuous_row = (row + 0.5) * cell_height
+    continuous_col = (col + 0.5) * cell_width
+    
+    return continuous_row, continuous_col
+
+
+def find_closest_continuous_position(target_row: float, target_col: float) -> Tuple[float, float]:
+    """Find the closest valid position in TARGET_CANDIDATE_CELLS."""
+    min_dist = float('inf')
+    closest_pos = TARGET_CANDIDATE_CELLS[0]
+    
+    for pos in TARGET_CANDIDATE_CELLS:
+        dist = math.sqrt((pos[0] - target_row)**2 + (pos[1] - target_col)**2)
+        if dist < min_dist:
+            min_dist = dist
+            closest_pos = pos
+    
+    return closest_pos
+
+
+def map_small_to_large_game(small_snapshot: Dict[str, object], seed: int) -> SwarmDefenseLargeState:
+    """Map small game snapshot to large game execution with 1:1 agent mapping."""
+    rng = random.Random(seed)
+    large_game = SwarmDefenseLargeGame()
+    large_state = large_game.new_initial_state()
+    
+    # Extract small game data
+    small_targets = small_snapshot["targets"]
+    small_ad_units = small_snapshot["ad_units"]
+    small_drones = small_snapshot["drones"]
+    
+    # Phase 1: Target positions (chance)
+    target_positions_mapped = []
+    for target in small_targets:
+        # Map grid position to continuous
+        continuous_pos = grid_to_continuous(int(target.row), int(target.col))
+        # Find closest valid position
+        closest_pos = find_closest_continuous_position(continuous_pos[0], continuous_pos[1])
+        target_positions_mapped.append(closest_pos)
+    
+    # Apply target position actions
+    for pos in target_positions_mapped:
+        # Find action index for this position
+        action_idx = TARGET_CANDIDATE_CELLS.index(pos)
+        action = TARGET_POSITION_ACTION_BASE + action_idx
+        if action in large_state.legal_actions():
+            large_state.apply_action(action)
+    
+    # Phase 2: Target values (chance)
+    if large_state.phase() == Phase.TARGET_VALUES:
+        legal = large_state.legal_actions()
+        action = rng.choice(legal)
+        large_state.apply_action(action)
+    
+    # Phase 3: AD placement (defender)
+    ad_positions_mapped = []
+    for ad_unit in small_ad_units:
+        # Map grid position to continuous
+        continuous_pos = grid_to_continuous(int(ad_unit["position"][0]), 
+                                           int(ad_unit["position"][1]))
+        ad_positions_mapped.append(continuous_pos)
+    
+    # Apply AD placement actions
+    for pos in ad_positions_mapped:
+        if large_state.phase() != Phase.AD_PLACEMENT:
+            break
+        # Find closest valid AD position
+        legal = large_state.legal_actions()
+        best_action = None
+        best_dist = float('inf')
+        
+        for action in legal:
+            from swarm_defense_large_game import decode_ad_position_action
+            candidate_pos = decode_ad_position_action(action)
+            dist = math.sqrt((candidate_pos[0] - pos[0])**2 + (candidate_pos[1] - pos[1])**2)
+            if dist < best_dist:
+                best_dist = dist
+                best_action = action
+        
+        if best_action is not None:
+            large_state.apply_action(best_action)
+    
+    # Phase 4: Drone assignment (attacker) - 1:1 mapping
+    for drone in small_drones:
+        if large_state.phase() != Phase.SWARM_ASSIGNMENT:
+            break
+            
+        entry_row, entry_col = drone["entry"]
+        # Map small game column to large game entry lane
+        entry_lane_idx = int((entry_col / small_game.GRID_SIZE) * ENTRY_LANES)
+        entry_lane_idx = max(0, min(entry_lane_idx, ENTRY_LANES - 1))
+        
+        # Use default blueprint (direct path)
+        blueprint_idx = 0
+        
+        action = encode_drone_action(
+            entry_lane_idx,
+            drone["target_idx"],
+            drone["tot_idx"],
+            blueprint_idx
+        )
+        
+        if action in large_state.legal_actions():
+            large_state.apply_action(action)
+        else:
+            # If exact action not legal, try to find similar one
+            legal = large_state.legal_actions()
+            if legal:
+                large_state.apply_action(rng.choice(legal))
+    
+    # Phase 5: Interceptor assignment (defender) - 1:1 mapping
+    interceptor_count = 0
+    while large_state.phase() == Phase.INTERCEPT_ASSIGNMENT and interceptor_count < NUM_INTERCEPTORS:
+        legal = large_state.legal_actions()
+        if not legal:
+            break
+        
+        # Randomly choose to engage or pass
+        action = rng.choice(legal)
+        large_state.apply_action(action)
+        interceptor_count += 1
+    
+    # Phase 6+: Resolution phases (chance)
+    while not large_state.is_terminal():
+        if large_state.current_player() == pyspiel.PlayerId.CHANCE:
+            outcomes = large_state.chance_outcomes()
+            pick = rng.random()
+            cumulative = 0.0
+            for action, prob in outcomes:
+                cumulative += prob
+                if pick <= cumulative:
+                    large_state.apply_action(action)
+                    break
+        else:
+            # Shouldn't happen in normal flow
+            legal = large_state.legal_actions()
+            if legal:
+                large_state.apply_action(rng.choice(legal))
+            else:
+                break
+    
+    return large_state
 
 
 def _write_snapshot(snapshot: Dict[str, object], output_path: Path) -> Path:
@@ -638,7 +876,9 @@ def _build_animation(snapshot: Dict[str, object], output_path: Path, *, time_ste
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Animate a Swarm Defense large episode")
+    parser = argparse.ArgumentParser(description="Animate a Swarm Defense large episode with learned policy")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                       help="Path to checkpoint directory with policy.pt")
     parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed")
     parser.add_argument("--time-step", type=float, default=0.25, help="Simulation timestep in seconds")
     parser.add_argument("--fps", type=int, default=12, help="Frames per second for the GIF")
@@ -651,16 +891,38 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    checkpoint_path = Path(args.checkpoint)
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 2**31 - 1)
-    rng = random.Random(seed)
-    abstract_snapshot = _generate_abstract_snapshot(seed)
-    blueprint = build_blueprint_from_small_snapshot(abstract_snapshot, rng=rng)
-    final_state = rollout_blueprint_episode(blueprint, seed=seed)
+    
+    print(f"Loading policy from: {checkpoint_path}")
+    policy_net, metadata = load_policy_network(checkpoint_path)
+    
+    game_config = metadata['game_config']
+    print(f"Policy trained on: {game_config['NUM_TARGETS']}T, "
+          f"{game_config['NUM_AD_UNITS']}AD, {game_config['NUM_ATTACKING_DRONES']}D, "
+          f"{game_config['NUM_INTERCEPTORS']}I")
+    print(f"Small grid size: {game_config['GRID_SIZE']}×{game_config['GRID_SIZE']}")
+    print(f"Large arena size: {ARENA_WIDTH:.0f}×{ARENA_HEIGHT:.0f}")
+    print(f"Mapping: 1:1 (same agent counts, continuous positions)")
+    print(f"Seed: {seed}\n")
+
+    print("Running small game with policy...")
+    small_snapshot = run_small_game_with_policy(policy_net, seed)
+    
+    print("Mapping to large game...")
+    final_state = map_small_to_large_game(small_snapshot, seed)
+    
     snapshot = final_state.snapshot()
     snapshot_path = _write_snapshot(snapshot, args.snapshot_output)
+    
+    print("Building animation...")
     _build_animation(snapshot, args.output, time_step=args.time_step, fps=args.fps)
-    print("Animation complete.")
+    
+    returns = final_state.returns()
+    print("\nAnimation complete.")
     print(f"Seed: {seed}")
+    print(f"Attacker damage: {returns[0]:.1f}")
+    print(f"Defender reward: {returns[1]:.1f}")
     print(f"Snapshot saved to: {snapshot_path}")
     print(f"Animation saved to: {args.output}")
 

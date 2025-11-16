@@ -5,7 +5,7 @@ import argparse
 import random
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -16,7 +16,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "ESCHER-Torch"))
 
 from ESCHER_Torch.eschersolver import PolicyNetwork
-from swarm_defense_game import SwarmDefenseState
+from swarm_defense_game import (
+    SwarmDefenseState,
+    Phase,
+    NUM_ATTACKING_DRONES,
+    INTERCEPT_ACTION_BASE,
+)
 from demo_visualizer import (
     _sample_chance_action,
     _defender_policy,
@@ -77,6 +82,48 @@ class PolicyWrapper:
             action = max(legal_actions, key=lambda a: probs[a])
         
         return action
+    
+    def get_action_with_probs(self, state: SwarmDefenseState, rng: random.Random, use_sampling: bool = False) -> Tuple[int, np.ndarray]:
+        """Get action from the trained policy along with probability distribution.
+        
+        Args:
+            state: Current game state
+            rng: Random number generator for sampling
+            use_sampling: If True, sample from distribution; if False, take argmax
+        
+        Returns:
+            Tuple of (action, probabilities array)
+        """
+        cur_player = state.current_player()
+        if cur_player != self.player_id:
+            raise ValueError(f"Policy is for player {self.player_id} but state is for player {cur_player}")
+        
+        legal_actions = state.legal_actions(cur_player)
+        if len(legal_actions) == 1:
+            # Create dummy probabilities
+            probs = np.zeros(state.get_game().num_distinct_actions())
+            probs[legal_actions[0]] = 1.0
+            return legal_actions[0], probs
+        
+        # Get info state and mask
+        info_state = np.array(state.information_state_tensor(cur_player), dtype=np.float32)
+        mask = np.array(state.legal_actions_mask(cur_player), dtype=np.float32)
+        
+        # Forward pass through network
+        with torch.no_grad():
+            info_tensor = torch.from_numpy(info_state).unsqueeze(0).to(self.device)
+            mask_tensor = torch.from_numpy(mask).unsqueeze(0).to(self.device)
+            probs = self.policy_network(info_tensor, mask_tensor)[0].cpu().numpy()
+        
+        # Sample or take argmax
+        if use_sampling:
+            # Sample according to probabilities
+            action = rng.choices(legal_actions, weights=[probs[a] for a in legal_actions])[0]
+        else:
+            # Take the action with highest probability
+            action = max(legal_actions, key=lambda a: probs[a])
+        
+        return action, probs
 
 
 def load_policy(
@@ -177,7 +224,21 @@ def play_episode_with_policy(
         else:  # player == 1
             if policy_wrapper_p1 is not None:
                 # Use trained policy for defender
-                action = policy_wrapper_p1.get_action(state, rng, use_sampling=use_sampling)
+                # Special handling for interceptor assignment phase
+                if state.phase() == Phase.INTERCEPT_ASSIGNMENT:
+                    action, probs = policy_wrapper_p1.get_action_with_probs(state, rng, use_sampling=use_sampling)
+                    pass_action = INTERCEPT_ACTION_BASE + NUM_ATTACKING_DRONES
+                    if action == pass_action:
+                        # Find the highest probability action that is not pass
+                        legal_actions = state.legal_actions(player)
+                        drone_actions = [a for a in legal_actions if a != pass_action]
+                        if drone_actions:
+                            # Choose drone with highest probability
+                            best_drone_action = max(drone_actions, key=lambda a: probs[a])
+                            print(f"  Interceptor pass (prob={probs[pass_action]:.3f}) replaced with highest prob drone: action={best_drone_action} (prob={probs[best_drone_action]:.3f})")
+                            action = best_drone_action
+                else:
+                    action = policy_wrapper_p1.get_action(state, rng, use_sampling=use_sampling)
             else:
                 # Use default defender policy
                 action = _defender_policy(state, rng)
