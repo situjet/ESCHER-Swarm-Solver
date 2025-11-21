@@ -100,7 +100,7 @@ We can now define regret. Regret is defined as:
 
 ![Regret equation](regret.png)
 
-What this means is that regret is defined as the difference between the action you *wish* you took, instead of the action you actually took. In other words, the better action to take at that time was action *a*, but you actually took action *a'* according to your mixed strategy, which incurs regret. We then have cumulative regret, which is, for an action *a*, how much better it would've been to take action *a* over all other actions prescribed by the mixed strategy.
+What this means is that regret is defined as the difference between the action you *wish* you took *in hindsight*, instead of the action you actually took. In other words, the better action to take at that time was action *a*, but you actually took action *a'* according to your mixed strategy, which incurs regret. We then have cumulative regret, which is, for an action *a*, how much better it would've been to take action *a* over all other actions prescribed by the mixed strategy. The hindsight part is important - it asks what would of happened if your strategy specifically consistently decided to *deviate at this specific point*. 
 
 To use chess as an example, let's assume you moved a pawn on the rook file as your opening move (this is generally considered one of the worst opening moves). In comparision, a good opening move would be pawn to e5 (center file). Then, if we compared the utilities of the two, evidentally the better move accumulates positive regret.
 
@@ -134,7 +134,7 @@ Furthermore, at each node, we're only going to really have an *infoset*, which i
 
 Let's say we tried to do the above LP approach to compute an exact solution. To create an LP, we need to convert this tree into a matrix representation, so that we could then do LP to maximize the row/minimize the column player. The question is, how big is this matrix?
 
-If we did a mixed strategy, and decided to mix over the probability of that entire infoset, then it follows that the size of that matrix would scale by the product of the infosets at *each layer of the tree*. And if it scales by the product of the infosets, then what we have is *combinatorial blowup* in the exponential degree. 
+If we did a mixed strategy, and decided to mix over the probability of that entire infoset, then it follows that the size of that matrix would scale by the **products** of the infosets at *each layer of the tree*. And if it scales by the product of the infosets, then what we have is *combinatorial blowup* in the exponential degree. 
 
 Well, this clearly doesn't work for any game of non-trivial size. So what can we do?
 
@@ -164,9 +164,11 @@ One more final thing. To elaborate more on the utility, we need some way of weig
 
 To simplify, this is just saying that from the infoset ***I***, we just say that the counterfactual value of taking the action *a* is equal to the probability of the observation node in the next layer multiplied by the utility of continuing to play out the rest of my strategy, which we then sum over all possible observation nodes.
 
-The *h* term here refers to the opponent's history, not ours. It's essentially saying that these are the set of opponent histories that would lead to this specific infoset I, so the nodes represent the possible true game state. This is perhaps the most interesting part of the entire counterfactual utility calculation - because you may note that *our* own history is irrelevant.
+The *h* term here refers to the opponent's history, not ours. It's essentially saying that these are the set of opponent histories that would lead to this specific infoset I, so the nodes represent the possible true game state. This is perhaps the most interesting part of the entire counterfactual utility calculation - because you may note that *our* own history is irrelevant. 
 
-Specifically, counterfactual utilities assert that the sequence of actions you took are irrelevant - rather, the infoset, and solving at the infoset itself is what actually matters. You then weight it by the reach probability, giving you the correct distribution of what your opponent would do, and how important/valuable certain game states are. The only thing that matters is the action you take next -> aka, calculating the **local regret**, which we already know how to do through **RM** or **RM+**.
+Specifically, counterfactual utilities assert that the sequence of actions you took are irrelevant - rather, the infoset, and solving at the infoset itself is what actually matters. You then weight it by the reach probability, giving you the correct distribution of what your opponent would do, and how important/valuable certain game states are. .
+
+The only thing that matters is the actions you can take next -> aka, calculating the **local counterfactual regret**, which we already know how to do through **RM** or **RM+**. This is where the prior emphasis on *hindsight* is important - this is why it's called *counterfactual regret*, because you're not actually asking whether or not one action is "objectively" better than the other, you're asking what the value is if you consistently deviated at this point, and play it out - "counterfactual". This allows you to explore optimal actions without ever reaching that state and minimize global regret, which converges to Nash equilibria.
 
 ### Counterfactual Regret Minimization
 
@@ -185,6 +187,8 @@ At this point, you might notice something about the framework. Conceptually, we'
 This is the basis behind **counterfactual regret minimization**, which is *the* algorithm behind how we optimally solve games. CFR is guaranteed to converge to a Nash equilibrium purely through self-play. Below is the actual algorithm:
 
 ![cfr](cfr.png)
+
+Within here is the *real power of CFR* - it takes that normal form game that we tried to solve with LP earlier, and rather than operating in exponential time, we've reduced it to a **polynomial time** algorothm.
 
 #### Caveats
 
