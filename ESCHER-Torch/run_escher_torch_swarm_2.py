@@ -30,7 +30,7 @@ from ESCHER_Torch import ESCHERSolverTorch  # noqa: E402
 GAME_NAME = "swarm_defense_large_v2"
 RESULT_DIR_NAME = "swarm_defense_large_v2"
 ENCODER_VERSION = "swarm_large_snapshot_v1"
-NETWORK_LAYERS = (512, 256, 128)
+NETWORK_LAYERS = (1024, 512, 256)
 VALUE_NETWORK_LAYERS = (512, 256, 128)
 
 NUM_TARGETS = large_swarm.NUM_TARGETS
@@ -285,6 +285,10 @@ def _snapshot_to_tensor(snapshot: Dict[str, object], player: int) -> List[float]
     features.append(
         _norm(snapshot.get("remaining_interceptors", NUM_INTERCEPTORS), max(1, NUM_INTERCEPTORS))
     )
+    features.append(_norm(snapshot.get("wave_quota", 0), max(1, NUM_DRONES)))
+    features.append(_norm(snapshot.get("wave_drone_count", 0), max(1, NUM_DRONES)))
+    features.append(_norm(snapshot.get("wave_interceptors_active", 0), max(1, NUM_INTERCEPTORS)))
+    features.append(1.0 if snapshot.get("wave_requires_fill") else 0.0)
     discovered = snapshot.get("discovered_ads", ())
     features.extend(_encode_discovered_ads(discovered))
     features.extend(_encode_targets(snapshot))

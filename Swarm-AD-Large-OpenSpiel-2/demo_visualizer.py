@@ -27,8 +27,7 @@ OUTPUT_PATH = OUTPUT_DIR / "swarm_defense_large_demo.png"
 TOT_COLORS = {
     LARGE_TOT_CHOICES[0]: "#ff4d4f",
     LARGE_TOT_CHOICES[1]: "#ffa940",
-    LARGE_TOT_CHOICES[2]: "#ffec3d",
-    LARGE_TOT_CHOICES[3]: "#9254de",
+    LARGE_TOT_CHOICES[2]: "#ffec3d"
 }
 DRONE_SPEED = 1.0
 AD_KILL_COLOR = "#FF3B30"

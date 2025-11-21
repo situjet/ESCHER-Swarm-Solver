@@ -34,8 +34,9 @@ from demo_animation import _build_animation as build_animation, _write_snapshot 
 from demo_visualizer import render_snapshot  # type: ignore
 from swarm_defense_large_game import (
     DRONE_ACTION_BASE,
-    DRONE_END_ACTION,
+    DRONE_ALLOC_ACTION_BASE,
     INTERCEPT_ACTION_BASE,
+    INTERCEPT_ALLOC_ACTION_BASE,
     INTERCEPT_END_ACTION,
     Phase,
     SwarmDefenseLargeState,
@@ -119,17 +120,37 @@ class PolicyController(Controller):
             action = rng.choices(legal_actions, weights=weights, k=1)[0]
         else:
             action = max(legal_actions, key=lambda a: action_probabilities.get(a, 0.0))
-        return action, {"probabilities": action_probabilities, "controller": "policy"}
+
+        metadata: Dict[str, object] = {"probabilities": action_probabilities, "controller": "policy"}
+        phase = state.phase() if hasattr(state, "phase") else None
+        # Mirror the small-game fix: discourage premature "end wave" selections when
+        # interceptors are still available and drones remain to target.
+        if (
+            player == 1
+            and phase == Phase.INTERCEPT_ASSIGNMENT
+            and action == INTERCEPT_END_ACTION
+        ):
+            snapshot = state.snapshot() if hasattr(state, "snapshot") else {}
+            active = int(snapshot.get("wave_interceptors_active", 0))
+            drone_actions = [a for a in legal_actions if a != INTERCEPT_END_ACTION]
+            if active > 0 and drone_actions:
+                best_drone = max(drone_actions, key=lambda a: action_probabilities.get(a, 0.0))
+                if best_drone != action:
+                    metadata["override"] = "intercept_drone"
+                    metadata["override_from"] = action
+                    metadata["override_to"] = best_drone
+                action = best_drone
+        return action, metadata
 
 
 class NaiveAttackerController(Controller):
-    def __init__(self, *, wave_budgets: Sequence[int] = (10, 10), label: str = "naive_attacker_10_per_wave") -> None:
+    def __init__(self, *, wave_budgets: Sequence[int] = (5, 5), label: str = "naive_attacker_10_per_wave") -> None:
         self.wave_budgets = {idx + 1: budget for idx, budget in enumerate(wave_budgets)}
         self.label = label
+        self._launched_by_wave: Dict[int, int] = {}
 
-    def _wave_launch_count(self, snapshot: Dict[str, object], current_wave: int) -> int:
-        drones: Sequence[Dict[str, object]] = snapshot.get("drones", ())  # type: ignore[assignment]
-        return sum(1 for drone in drones if int(drone.get("wave", 1)) == current_wave)
+    def _record_launch(self, wave: int) -> None:
+        self._launched_by_wave[wave] = self._launched_by_wave.get(wave, 0) + 1
 
     def choose_action(self, state: pyspiel.State, rng: random.Random) -> Tuple[int, Dict[str, object]]:
         player = state.current_player()
@@ -140,16 +161,30 @@ class NaiveAttackerController(Controller):
             raise RuntimeError("No legal attacker actions available")
         if len(legal_actions) == 1:
             return legal_actions[0], {"controller": self.label}
-        if hasattr(state, "phase") and state.phase() == Phase.SWARM_ASSIGNMENT:
+        phase = state.phase() if hasattr(state, "phase") else None
+        if phase == Phase.SWARM_WAVE_ALLOCATION:
             snapshot = state.snapshot()
             current_wave = int(snapshot.get("current_wave", 1))
-            launched = self._wave_launch_count(snapshot, current_wave)
-            budget = self.wave_budgets.get(current_wave, len(legal_actions))
-            if launched >= budget and DRONE_END_ACTION in legal_actions:
-                return DRONE_END_ACTION, {"controller": self.label}
-            drone_actions = [a for a in legal_actions if DRONE_ACTION_BASE <= a < DRONE_END_ACTION]
+            remaining = int(snapshot.get("remaining_drones", 0))
+            desired = self.wave_budgets.get(current_wave, remaining)
+            desired = max(0, min(desired, remaining))
+            allocations = sorted(action - DRONE_ALLOC_ACTION_BASE for action in legal_actions)
+            if allocations:
+                desired = max(allocations[0], min(desired, allocations[-1]))
+                self.wave_budgets[current_wave] = desired
+                action = DRONE_ALLOC_ACTION_BASE + desired
+                if action in legal_actions:
+                    return action, {"controller": self.label, "allocation": desired}
+            return rng.choice(legal_actions), {"controller": self.label}
+
+        if phase == Phase.SWARM_ASSIGNMENT:
+            snapshot = state.snapshot()
+            current_wave = int(snapshot.get("current_wave", 1))
+            drone_actions = [a for a in legal_actions if a >= DRONE_ACTION_BASE]
             if drone_actions:
-                return rng.choice(drone_actions), {"controller": self.label}
+                action = rng.choice(drone_actions)
+                self._record_launch(current_wave)
+                return action, {"controller": self.label}
         return rng.choice(legal_actions), {"controller": self.label}
 
 
@@ -168,12 +203,28 @@ class NaiveDefenderController(Controller):
             raise RuntimeError("No legal defender actions available")
         if len(legal_actions) == 1:
             return legal_actions[0], {"controller": self.label}
-        if hasattr(state, "phase") and state.phase() == Phase.INTERCEPT_ASSIGNMENT:
+        phase = state.phase() if hasattr(state, "phase") else None
+        if phase == Phase.INTERCEPTOR_WAVE_ALLOCATION:
             snapshot = state.snapshot()
             current_wave = int(snapshot.get("current_wave", 1))
+            remaining = int(snapshot.get("remaining_interceptors", 0))
+            desired = max(0, min(self.intercepts_per_wave, remaining))
+            allocations = sorted(action - INTERCEPT_ALLOC_ACTION_BASE for action in legal_actions)
+            if allocations:
+                desired = max(allocations[0], min(desired, allocations[-1]))
+                self._shots_fired[current_wave] = 0
+                action = INTERCEPT_ALLOC_ACTION_BASE + desired
+                if action in legal_actions:
+                    return action, {"controller": self.label, "allocation": desired}
+            return rng.choice(legal_actions), {"controller": self.label}
+
+        if phase == Phase.INTERCEPT_ASSIGNMENT:
+            snapshot = state.snapshot()
+            current_wave = int(snapshot.get("current_wave", 1))
+            cap = min(self.intercepts_per_wave, int(snapshot.get("wave_interceptors_active", 0)))
             fired = self._shots_fired.get(current_wave, 0)
             intercept_actions = [a for a in legal_actions if INTERCEPT_ACTION_BASE <= a < INTERCEPT_END_ACTION]
-            if fired >= self.intercepts_per_wave or not intercept_actions:
+            if cap <= 0 or fired >= cap or not intercept_actions:
                 if INTERCEPT_END_ACTION in legal_actions:
                     return INTERCEPT_END_ACTION, {"controller": self.label}
                 return rng.choice(legal_actions), {"controller": self.label}

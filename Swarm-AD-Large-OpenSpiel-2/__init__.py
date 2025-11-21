@@ -7,8 +7,10 @@ from .swarm_defense_large_game import (
     DronePlan,
     Phase,
     decode_drone_action,
+    decode_drone_allocation_action,
     encode_drone_action,
     decode_interceptor_action,
+    decode_interceptor_allocation_action,
     MIDPOINT_STRATEGIES,
     LARGE_TOT_CHOICES,
 )
@@ -21,8 +23,10 @@ __all__ = [
     "DronePlan",
     "Phase",
     "decode_drone_action",
+    "decode_drone_allocation_action",
     "encode_drone_action",
     "decode_interceptor_action",
+    "decode_interceptor_allocation_action",
     "MIDPOINT_STRATEGIES",
     "LARGE_TOT_CHOICES",
 ]

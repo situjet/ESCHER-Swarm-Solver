@@ -6,6 +6,7 @@ import socket
 import ssl
 import sys
 import uuid
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -36,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Play visualize_policy and push its snapshot to WinTAK using the trusted CoT helpers."
     )
+    parser.add_argument(
+        "--snapshot",
+        type=str,
+        help="Path to a precomputed wintak_snapshot.json; skips policy rollout",
+    )
     parser.add_argument("--policy", type=str, help="Single checkpoint applied to both players")
     parser.add_argument("--policy-p0", type=str, help="Checkpoint for attacker (player 0)")
     parser.add_argument("--policy-p1", type=str, help="Checkpoint for defender (player 1)")
@@ -56,6 +62,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_policy_paths(args: argparse.Namespace) -> Tuple[Optional[Path], Optional[Path]]:
+    if args.snapshot:
+        raise SystemExit("--snapshot provided; policy checkpoints should be omitted")
+
     if args.policy:
         path = Path(args.policy).expanduser().resolve()
         if not path.exists():
@@ -80,6 +89,18 @@ def _matchup_label(p0: Optional[Path], p1: Optional[Path]) -> str:
     if not p0 and p1:
         return "naive-v-policy"
     return "naive-v-naive"
+
+
+def _load_snapshot(snapshot_arg: str) -> Tuple[Dict[str, Any], Path]:
+    snapshot_path = Path(snapshot_arg).expanduser().resolve()
+    if not snapshot_path.exists():
+        raise SystemExit(f"Snapshot file not found: {snapshot_path}")
+
+    with snapshot_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise SystemExit("Snapshot JSON must be an object")
+    return payload, snapshot_path
 
 
 def _extract_row_col(point: Sequence[float] | None) -> Optional[Tuple[float, float]]:
@@ -288,28 +309,43 @@ def send_cot_events(events: List[str], endpoint: str, *, dry_run: bool, export_f
 
 def main() -> None:
     args = parse_args()
-    policy_p0, policy_p1 = _resolve_policy_paths(args)
-    matchup = args.scenario_id or _matchup_label(policy_p0, policy_p1)
+    snapshot: Dict[str, Any]
+    seed: Optional[int]
+    return_values: Optional[Sequence[float]] = None
 
-    state, seed = play_episode_with_policy(
-        policy_path_p0=policy_p0,
-        policy_path_p1=policy_p1,
-        seed=args.seed,
-        use_sampling=args.sampling,
-        device=args.device,
-    )
+    if args.snapshot:
+        snapshot, snapshot_path = _load_snapshot(args.snapshot)
+        policy_p0 = policy_p1 = None
+        matchup = args.scenario_id or snapshot_path.stem
+        seed = snapshot.get("seed")
+    else:
+        policy_p0, policy_p1 = _resolve_policy_paths(args)
+        matchup = args.scenario_id or _matchup_label(policy_p0, policy_p1)
+        state, seed = play_episode_with_policy(
+            policy_path_p0=policy_p0,
+            policy_path_p1=policy_p1,
+            seed=args.seed,
+            use_sampling=args.sampling,
+            device=args.device,
+        )
+        snapshot = state.snapshot()
+        return_values = state.returns()
 
-    snapshot = state.snapshot()
+    if return_values is None:
+        raw_returns = snapshot.get("returns")
+        if isinstance(raw_returns, Sequence):
+            return_values = raw_returns
+
     prefix = args.callsign_prefix.upper().strip() or "SWARM"
     events, counts = build_cot_events(snapshot, prefix)
     send_cot_events(events, args.cot_endpoint, dry_run=args.dry_run, export_file=args.export_file)
 
-    returns = state.returns()
     print("-" * 60)
     print(f"Scenario: {matchup}")
     print(f"Seed: {seed}")
-    print(f"Attacker damage: {returns[0]:.2f}")
-    print(f"Defender reward: {returns[1]:.2f}")
+    if return_values:
+        print(f"Attacker damage: {return_values[0]:.2f}")
+        print(f"Defender reward: {return_values[1]:.2f}")
     print(
         "Event mix -> "
         f"drones={counts.get('drones', 0)}, "

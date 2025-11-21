@@ -52,24 +52,24 @@ except ImportError:  # pragma: no cover - fallback for script execution
         smooth_path,
     )
 
-ARENA_WIDTH = 32.0
-ARENA_HEIGHT = 32.0
+ARENA_WIDTH = 24.0
+ARENA_HEIGHT = 24.0
 BOTTOM_START = ARENA_HEIGHT * 0.5
 NUM_TARGETS = 3
 NUM_AD_UNITS = 2
-NUM_ATTACKING_DRONES = 10
+NUM_ATTACKING_DRONES = 12
 NUM_INTERCEPTORS = NUM_ATTACKING_DRONES // 2
 NUM_WAVES = 2
 DRONE_SPEED = 1.0
 INTERCEPTOR_SPEED_MULTIPLIER = 2.0
 ENTRY_LANES = 24
 ENTRY_POINTS: List[Tuple[float, float]] = [(0.0, lane + 0.5) for lane in range(ENTRY_LANES)]
-LARGE_TOT_CHOICES: Tuple[float, ...] = (0.0, 1.5, 3.0, 4.5)
+LARGE_TOT_CHOICES: Tuple[float, ...] = (0.0, 1.5, 3.0)
 AD_COVERAGE_RADIUS = 5.5
-AD_KILL_RATE = .05
+AD_KILL_RATE = .075
 AD_MIN_EFFECTIVE_EXPOSURE = 0.75
 INTERCEPTOR_LAUNCH_ROW = ARENA_HEIGHT + 2.0
-INTERCEPTOR_KILL_PROB = 0.95
+INTERCEPTOR_KILL_PROB = 0.9
 DRONE_VS_AD_KILL_PROB = 0.8
 DRONE_VS_TARGET_KILL_PROB = 0.7
 INTERCEPTOR_LEFTOVER_VALUE = 5.0
@@ -112,7 +112,12 @@ DRONE_END_ACTION = DRONE_ACTION_BASE + DRONE_ASSIGNMENT_ACTIONS
 INTERCEPT_ACTION_BASE = DRONE_END_ACTION + 1
 INTERCEPT_END_ACTION = INTERCEPT_ACTION_BASE + INTERCEPT_SELECTIONS
 AD_RESOLVE_ACTION_BASE = INTERCEPT_END_ACTION + 1
-NUM_DISTINCT_ACTIONS = AD_RESOLVE_ACTION_BASE + 2
+AD_RESOLVE_ACTIONS = 2
+DRONE_ALLOC_ACTION_BASE = AD_RESOLVE_ACTION_BASE + AD_RESOLVE_ACTIONS
+DRONE_ALLOC_ACTIONS = NUM_ATTACKING_DRONES + 1
+INTERCEPT_ALLOC_ACTION_BASE = DRONE_ALLOC_ACTION_BASE + DRONE_ALLOC_ACTIONS
+INTERCEPT_ALLOC_ACTIONS = NUM_INTERCEPTORS + 1
+NUM_DISTINCT_ACTIONS = INTERCEPT_ALLOC_ACTION_BASE + INTERCEPT_ALLOC_ACTIONS
 
 BOUNDS = Bounds(0.0, ARENA_HEIGHT, 0.0, ARENA_WIDTH)
 
@@ -206,7 +211,9 @@ class Phase(Enum):
     TARGET_POSITIONS = auto()
     TARGET_VALUES = auto()
     AD_PLACEMENT = auto()
+    SWARM_WAVE_ALLOCATION = auto()
     SWARM_ASSIGNMENT = auto()
+    INTERCEPTOR_WAVE_ALLOCATION = auto()
     INTERCEPT_ASSIGNMENT = auto()
     INTERCEPT_RESOLUTION = auto()
     AD_RESOLUTION = auto()
@@ -265,6 +272,20 @@ def decode_interceptor_action(action: int) -> int:
     return rel
 
 
+def decode_drone_allocation_action(action: int) -> int:
+    rel = action - DRONE_ALLOC_ACTION_BASE
+    if not (0 <= rel < DRONE_ALLOC_ACTIONS):
+        raise ValueError("Drone wave allocation out of range")
+    return rel
+
+
+def decode_interceptor_allocation_action(action: int) -> int:
+    rel = action - INTERCEPT_ALLOC_ACTION_BASE
+    if not (0 <= rel < INTERCEPT_ALLOC_ACTIONS):
+        raise ValueError("Interceptor wave allocation out of range")
+    return rel
+
+
 class SwarmDefenseLargeState(pyspiel.State):
     def __init__(self, game: "SwarmDefenseLargeGame"):
         super().__init__(game)
@@ -278,10 +299,11 @@ class SwarmDefenseLargeState(pyspiel.State):
         self._drone_plans: List[DronePlan] = []
         self._remaining_drones = NUM_ATTACKING_DRONES
         self._remaining_interceptors = NUM_INTERCEPTORS
+        self._wave_interceptors_remaining = 0
         self._current_wave = 1
         self._active_wave = 1
         self._wave_drone_count = 0
-        self._wave_quota = NUM_ATTACKING_DRONES
+        self._wave_quota = 0
         self._wave_requires_fill = False
         self._wave_plan_indices: Dict[int, List[int]] = {wave: [] for wave in range(1, NUM_WAVES + 1)}
         self._discovered_ads: set[int] = set()
@@ -316,6 +338,10 @@ class SwarmDefenseLargeState(pyspiel.State):
             "discovered_ads": tuple(sorted(self._discovered_ads)),
             "wave_start_offsets": dict(self._wave_start_offsets),
             "wave_completion_times": dict(self._wave_completion_times),
+            "wave_quota": self._wave_quota,
+            "wave_drone_count": self._wave_drone_count,
+            "wave_interceptors_active": self._wave_interceptors_remaining,
+            "wave_requires_fill": self._wave_requires_fill,
             "targets": tuple(self._targets),
             "target_destroyed": tuple(self._target_destroyed),
             "ad_units": tuple(
@@ -388,32 +414,34 @@ class SwarmDefenseLargeState(pyspiel.State):
         self._current_wave = wave
         self._active_wave = wave
         self._wave_drone_count = 0
-        self._wave_quota = self._remaining_drones
-        self._wave_requires_fill = wave == NUM_WAVES
+        self._wave_quota = 0
+        self._wave_requires_fill = False
         self._tot_anchor = None
         self._wave_plan_indices.setdefault(wave, [])
         if wave not in self._wave_start_offsets:
             self._wave_start_offsets[wave] = self._timeline_cursor
-        self._phase = Phase.SWARM_ASSIGNMENT
+        self._phase = Phase.SWARM_WAVE_ALLOCATION
 
     def _prepare_for_interceptors(self) -> None:
         self._active_wave = self._current_wave
         self._interceptor_engaged.clear()
         self._pending_interceptor_hits.clear()
         self._next_interceptor_resolution_index = 0
+        self._wave_interceptors_remaining = 0
         indices = self._wave_plan_indices.get(self._current_wave, [])
         if not indices:
             self._start_post_interceptor_resolution()
             return
         self._synchronize_wave_tot_schedule(self._current_wave)
-        if self._remaining_interceptors > 0 and self._available_intercept_targets():
-            self._phase = Phase.INTERCEPT_ASSIGNMENT
+        intercept_targets = self._available_intercept_targets()
+        if self._remaining_interceptors > 0 and intercept_targets:
+            self._phase = Phase.INTERCEPTOR_WAVE_ALLOCATION
         else:
             self._start_post_interceptor_resolution()
 
     def _available_intercept_targets(self) -> List[int]:
         choices: List[int] = []
-        for idx in self._wave_drone_indices(self._current_wave):
+        for idx in self._wave_drone_indices(self._active_wave):
             plan = self._drone_plans[idx]
             if plan.destroyed_by is not None:
                 continue
@@ -475,7 +503,7 @@ class SwarmDefenseLargeState(pyspiel.State):
             Phase.TARGET_DAMAGE_RESOLUTION,
         ):
             return pyspiel.PlayerId.CHANCE
-        if self._phase in (Phase.AD_PLACEMENT, Phase.INTERCEPT_ASSIGNMENT):
+        if self._phase in (Phase.AD_PLACEMENT, Phase.INTERCEPTOR_WAVE_ALLOCATION, Phase.INTERCEPT_ASSIGNMENT):
             return 1
         return 0
 
@@ -498,6 +526,12 @@ class SwarmDefenseLargeState(pyspiel.State):
                 if pos not in occupied:
                     actions.append(AD_ACTION_BASE + idx)
             return actions
+        if self._phase == Phase.SWARM_WAVE_ALLOCATION:
+            max_alloc = self._remaining_drones
+            min_alloc = max_alloc if self._current_wave >= NUM_WAVES else 0
+            if max_alloc < min_alloc:
+                min_alloc = max_alloc
+            return [DRONE_ALLOC_ACTION_BASE + alloc for alloc in range(min_alloc, max_alloc + 1)]
         if self._phase == Phase.SWARM_ASSIGNMENT:
             actions: List[int] = []
             if self._wave_quota > 0 and self._wave_drone_count < self._wave_quota:
@@ -506,12 +540,15 @@ class SwarmDefenseLargeState(pyspiel.State):
                     _, target_idx, _, _ = decode_drone_action(action)
                     if self._is_target_allowed_for_current_wave(target_idx):
                         actions.append(action)
-            if self._current_wave < NUM_WAVES:
+            if self._current_wave < NUM_WAVES and not self._wave_requires_fill:
                 actions.append(DRONE_END_ACTION)
             return actions
+        if self._phase == Phase.INTERCEPTOR_WAVE_ALLOCATION:
+            max_alloc = self._remaining_interceptors
+            return [INTERCEPT_ALLOC_ACTION_BASE + alloc for alloc in range(max_alloc + 1)]
         if self._phase == Phase.INTERCEPT_ASSIGNMENT:
             actions: List[int] = []
-            if self._remaining_interceptors > 0:
+            if self._wave_interceptors_remaining > 0:
                 for idx in self._available_intercept_targets():
                     actions.append(INTERCEPT_ACTION_BASE + idx)
             actions.append(INTERCEPT_END_ACTION)
@@ -585,8 +622,12 @@ class SwarmDefenseLargeState(pyspiel.State):
             self._apply_target_value_action(action)
         elif self._phase == Phase.AD_PLACEMENT:
             self._apply_ad_action(action)
+        elif self._phase == Phase.SWARM_WAVE_ALLOCATION:
+            self._apply_drone_allocation_action(action)
         elif self._phase == Phase.SWARM_ASSIGNMENT:
             self._apply_drone_action(action)
+        elif self._phase == Phase.INTERCEPTOR_WAVE_ALLOCATION:
+            self._apply_interceptor_allocation_action(action)
         elif self._phase == Phase.INTERCEPT_ASSIGNMENT:
             self._apply_interceptor_action(action)
         elif self._phase == Phase.INTERCEPT_RESOLUTION:
@@ -631,10 +672,26 @@ class SwarmDefenseLargeState(pyspiel.State):
         if len(self._ad_units) == NUM_AD_UNITS:
             self._begin_wave(1)
 
+    def _apply_drone_allocation_action(self, action: int) -> None:
+        allocation = decode_drone_allocation_action(action)
+        max_available = self._remaining_drones
+        if allocation > max_available:
+            raise ValueError("Cannot allocate more drones than remain")
+        if self._current_wave == NUM_WAVES and allocation != max_available:
+            raise ValueError("Final wave must commit all remaining drones")
+        self._wave_quota = allocation
+        self._wave_requires_fill = allocation > 0
+        if allocation <= 0:
+            self._prepare_for_interceptors()
+        else:
+            self._phase = Phase.SWARM_ASSIGNMENT
+
     def _apply_drone_action(self, action: int) -> None:
         if action == DRONE_END_ACTION:
             if self._current_wave >= NUM_WAVES:
                 raise ValueError("Cannot prematurely end the final wave")
+            if self._wave_requires_fill:
+                raise ValueError("Wave allocation requires full deployment")
             self._prepare_for_interceptors()
             return
         if self._remaining_drones <= 0 or self._wave_drone_count >= self._wave_quota:
@@ -655,6 +712,17 @@ class SwarmDefenseLargeState(pyspiel.State):
             self._wave_requires_fill and self._wave_drone_count >= self._wave_quota
         ):
             self._prepare_for_interceptors()
+
+    def _apply_interceptor_allocation_action(self, action: int) -> None:
+        allocation = decode_interceptor_allocation_action(action)
+        if allocation > self._remaining_interceptors:
+            raise ValueError("Cannot allocate more interceptors than remain")
+        self._wave_interceptors_remaining = allocation
+        self._remaining_interceptors -= allocation
+        if self._wave_interceptors_remaining > 0 and self._available_intercept_targets():
+            self._phase = Phase.INTERCEPT_ASSIGNMENT
+        else:
+            self._start_post_interceptor_resolution()
 
     def _synchronize_wave_tot_schedule(self, wave: int) -> None:
         indices = self._wave_plan_indices.get(wave, [])
@@ -716,8 +784,8 @@ class SwarmDefenseLargeState(pyspiel.State):
         if action == INTERCEPT_END_ACTION:
             self._start_post_interceptor_resolution()
             return
-        if self._remaining_interceptors <= 0:
-            raise ValueError("No interceptors remaining")
+        if self._wave_interceptors_remaining <= 0:
+            raise ValueError("No interceptors allocated for this wave")
         drone_idx = decode_interceptor_action(action)
         if drone_idx not in self._wave_plan_indices.get(self._current_wave, []):
             raise ValueError("Can only intercept drones from the active wave")
@@ -739,8 +807,8 @@ class SwarmDefenseLargeState(pyspiel.State):
                         )
                     )
                     self._interceptor_engaged.add(drone_idx)
-        self._remaining_interceptors = max(0, self._remaining_interceptors - 1)
-        if self._remaining_interceptors == 0 or not self._available_intercept_targets():
+        self._wave_interceptors_remaining = max(0, self._wave_interceptors_remaining - 1)
+        if self._wave_interceptors_remaining == 0 or not self._available_intercept_targets():
             self._start_post_interceptor_resolution()
 
     def _arrival_time(self, plan: DronePlan, distance: float) -> float:
@@ -748,6 +816,7 @@ class SwarmDefenseLargeState(pyspiel.State):
         return plan.hold_time + travel
 
     def _start_post_interceptor_resolution(self) -> None:
+        self._wave_interceptors_remaining = 0
         if self._pending_interceptor_hits:
             self._phase = Phase.INTERCEPT_RESOLUTION
             self._next_interceptor_resolution_index = 0
@@ -1077,8 +1146,14 @@ class SwarmDefenseLargeState(pyspiel.State):
             return f"interceptor:drone={choice}"
         if action == INTERCEPT_END_ACTION:
             return "interceptor:end_wave"
-        if AD_RESOLVE_ACTION_BASE <= action < NUM_DISTINCT_ACTIONS:
+        if AD_RESOLVE_ACTION_BASE <= action < AD_RESOLVE_ACTION_BASE + AD_RESOLVE_ACTIONS:
             return "ad_resolution:success" if action == AD_RESOLVE_ACTION_BASE + 1 else "ad_resolution:fail"
+        if DRONE_ALLOC_ACTION_BASE <= action < INTERCEPT_ALLOC_ACTION_BASE:
+            allocation = decode_drone_allocation_action(action)
+            return f"drone_wave_alloc:{allocation}"
+        if INTERCEPT_ALLOC_ACTION_BASE <= action < NUM_DISTINCT_ACTIONS:
+            allocation = decode_interceptor_allocation_action(action)
+            return f"interceptor_wave_alloc:{allocation}"
         return f"unknown_action:{action}"
 
     def _describe_target(self, target_idx: int) -> str:
@@ -1122,8 +1197,10 @@ _GAME_INFO = pyspiel.GameInfo(
         NUM_TARGETS
         + 1
         + NUM_AD_UNITS
+        + NUM_WAVES  # drone wave allocations
         + NUM_ATTACKING_DRONES * NUM_WAVES
-        + (NUM_WAVES - 1)
+        + NUM_WAVES  # optional early wave endings
+        + NUM_WAVES  # interceptor wave allocations
         + NUM_INTERCEPTORS
         + NUM_WAVES
         + NUM_AD_UNITS * NUM_WAVES
@@ -1165,6 +1242,8 @@ __all__ = [
     "decode_drone_action",
     "encode_drone_action",
     "decode_interceptor_action",
+    "decode_drone_allocation_action",
+    "decode_interceptor_allocation_action",
     "LARGE_TOT_CHOICES",
     "ENTRY_POINTS",
     "MIDPOINT_STRATEGIES",

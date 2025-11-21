@@ -28,6 +28,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SNAPSHOT_PATH = PROJECT_ROOT / "Visualizer" / "swarm_large_snapshot.json"
 
 
+def _normalize_snapshot_path(path_str: str) -> Path:
+    """Convert raw snapshot paths (including WSL /mnt/ prefixes) to host paths."""
+
+    normalized = path_str.replace("\\", "/")
+    if normalized.startswith("/mnt/"):
+        pieces = normalized.split("/", 3)
+        if len(pieces) >= 4 and len(pieces[2]) == 1:
+            drive = pieces[2].upper()
+            remainder = pieces[3]
+            return Path(f"{drive}:/") / remainder
+    return Path(path_str)
+
+
 def _snapshot_path_from_summary(summary_path: Path) -> Optional[Path]:
     """Resolve the WinTAK snapshot path stored in an inference summary file."""
 
@@ -46,7 +59,7 @@ def _snapshot_path_from_summary(summary_path: Path) -> Optional[Path]:
         print(f"Warning: Summary {summary_path} does not reference a WinTAK snapshot.")
         return None
 
-    candidate = Path(snapshot_str)
+    candidate = _normalize_snapshot_path(snapshot_str)
     if not candidate.is_absolute():
         candidate = summary_path.parent / candidate
     return candidate

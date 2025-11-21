@@ -34,8 +34,10 @@ INTERCEPTOR_KILL_COLOR = "#0bc5ea"
 AD_TARGET_KILL_COLOR = "#2E8B57"
 AD_ROTATION_ARROW_COLOR = "#1f4c94"
 DISCOVERY_HALO_COLOR = "#ff9f1c"
-INTERCEPTOR_ORIGIN = (30.0, 0.0)
+INTERCEPTOR_ORIGIN = (ARENA_HEIGHT + 1.0, 0.0)
 INTERCEPTOR_VISUAL_DURATION = 6.0
+INTERCEPTOR_MIN_LEAD = 1.5
+INTERCEPTOR_MIN_DURATION = 3
 TARGET_KILL_COLOR = "#F1C40F"
 TARGET_KILL_EDGE = "#7D6608"
 TARGET_KILL_MARKER = "P"
@@ -94,6 +96,7 @@ class DroneSeries:
     entry: Tuple[float, float]
     tot_offset: float
     start_time: float
+    first_motion_time: float
     times: List[float]
     points: List[Tuple[float, float]]
     destroyed_time: Optional[float]
@@ -109,7 +112,6 @@ def _tot_color(tot: float) -> str:
         LARGE_TOT_CHOICES[0]: "#ff4d4f",
         LARGE_TOT_CHOICES[1]: "#ffa940",
         LARGE_TOT_CHOICES[2]: "#ffec3d",
-        LARGE_TOT_CHOICES[3]: "#9254de",
     }
     return palette.get(tot, "tab:red")
 
@@ -233,9 +235,13 @@ def _prepare_drone_series(snapshot: Dict[str, object]) -> List[DroneSeries]:
         times: List[float] = []
         points: List[Tuple[float, float]] = []
         prev_sample: Optional[Tuple[float, float, float]] = None
+        first_motion_time: Optional[float] = None
         for row, col, dist in samples:
-            times.append(hold + dist / DRONE_SPEED)
+            sample_time = hold + dist / DRONE_SPEED
+            times.append(sample_time)
             points.append((row, col))
+            if first_motion_time is None and dist > 1e-6:
+                first_motion_time = sample_time
             if kill_distance is not None and dist >= kill_distance:
                 if dist > kill_distance and prev_sample is not None and dist != prev_sample[2]:
                     ratio = (kill_distance - prev_sample[2]) / (dist - prev_sample[2])
@@ -253,6 +259,8 @@ def _prepare_drone_series(snapshot: Dict[str, object]) -> List[DroneSeries]:
         if not times:
             times = [hold]
             points = [entry]
+        if first_motion_time is None:
+            first_motion_time = times[0] if times else hold
         destroyed_time: Optional[float] = kill.get("time") if isinstance(kill, dict) else None
         kill_point = kill.get("point") if isinstance(kill, dict) else None
         kill_type = kill.get("type") if isinstance(kill, dict) else None
@@ -264,6 +272,7 @@ def _prepare_drone_series(snapshot: Dict[str, object]) -> List[DroneSeries]:
                 entry,
                 tot,
                 hold,
+                first_motion_time,
                 times,
                 points,
                 destroyed_time,
@@ -347,7 +356,10 @@ def _position_at(drone: DroneSeries, t: float) -> Tuple[float, float]:
 def _max_time(series: Sequence[DroneSeries]) -> float:
     max_t = 0.0
     for drone in series:
-        max_t = max(max_t, drone.times[-1] if drone.times else drone.tot)
+        candidate = drone.times[-1] if drone.times else drone.first_motion_time
+        if drone.destroyed_time is not None:
+            candidate = max(candidate, drone.destroyed_time)
+        max_t = max(max_t, candidate)
     return max_t + 2.0
 
 
@@ -396,6 +408,30 @@ def _orientation_from_events(
     return orientation
 
 
+def _wave_timeline(series: Sequence[DroneSeries]) -> Dict[int, Dict[str, float]]:
+    timeline: Dict[int, Dict[str, float]] = {}
+    for ser in series:
+        end_time = max(ser.times[-1] if ser.times else ser.start_time, ser.destroyed_time or 0.0)
+        start_time = ser.first_motion_time
+        data = timeline.setdefault(ser.wave, {"start": start_time, "end": end_time})
+        data["start"] = min(data["start"], start_time)
+        data["end"] = max(data["end"], end_time)
+    return timeline
+
+
+def _active_wave_index(timeline: Dict[int, Dict[str, float]], current_time: float) -> int:
+    if not timeline:
+        return 1
+    ordered = sorted(timeline.items())
+    active = ordered[0][0]
+    for wave, window in ordered:
+        if current_time >= window["start"] - 1e-6:
+            active = wave
+        else:
+            break
+    return active
+
+
 def _build_animation(state: SwarmDefenseLargeState, output_path: Path, *, time_step: float, fps: int) -> None:
     snapshot = state.snapshot()
     series = _prepare_drone_series(snapshot)
@@ -410,53 +446,11 @@ def _build_animation(state: SwarmDefenseLargeState, output_path: Path, *, time_s
     remaining_interceptors = int(snapshot.get("remaining_interceptors", 0))
     wave_stats = _wave_statistics(drones, len(targets))
     ad_kills, interceptor_kills, survivors, ad_attrit = _count_outcomes(drones)
-    allocation_lines = [
-        f"AD{idx}: {len(unit.get('intercept_log', ())) } kills" for idx, unit in enumerate(ad_units)
-    ]
-    summary_lines: List[str] = [
-        f"Phase: {phase}",
-        f"Current wave: {current_wave}/{NUM_WAVES}",
-        f"Remaining drones: {remaining_drones}",
-        f"Remaining interceptors: {remaining_interceptors}",
-        f"Discovered ADs: {_format_ad_list(discovered_ads)}",
-        "",
-    ]
-    for wave in range(1, NUM_WAVES + 1):
-        info = wave_stats.get(
-            wave,
-            {
-                "launched": 0,
-                "survivors": 0,
-                "targets_hit": 0,
-                "ads_neutralized": 0,
-                "ad_intercepts": 0,
-                "interceptor_losses": 0,
-                "other_losses": 0,
-            },
-        )
-        summary_lines.append(
-            f"Wave {wave}: launched {info['launched']} | survivors {info['survivors']}"
-        )
-        summary_lines.append(
-            "  "
-            + f"Targets hit {info['targets_hit']} | ADs neutralized {info['ads_neutralized']}"
-        )
-        losses = (
-            f"AD {info['ad_intercepts']}  INT {info['interceptor_losses']}  Other {info['other_losses']}"
-        )
-        summary_lines.append(f"  Losses → {losses}")
-    summary_lines.extend(
-        [
-            "",
-            f"AD intercepts: {ad_kills}",
-            f"AD-target strikes: {ad_attrit}",
-            f"Interceptor kills: {interceptor_kills}",
-            f"Survivors: {survivors}",
-            "",
-            "AD allocation:",
-        ]
-    )
-    summary_lines.extend(f"  {line}" for line in allocation_lines)
+    wave_timeline = _wave_timeline(series)
+    series_by_wave: Dict[int, List[DroneSeries]] = {}
+    for item in series:
+        series_by_wave.setdefault(item.wave, []).append(item)
+    wave_totals = {wave: len(items) for wave, items in series_by_wave.items()}
     max_t = _max_time(series)
     frames = int(math.ceil(max_t / time_step)) + 1
 
@@ -631,7 +625,13 @@ def _build_animation(state: SwarmDefenseLargeState, output_path: Path, *, time_s
                 edgecolors="black",
             )
             track = ax.plot([], [], color=INTERCEPTOR_KILL_COLOR, linewidth=1.5, alpha=0.0)[0]
-            start_time = max(0.0, ser.destroyed_time - INTERCEPTOR_VISUAL_DURATION)
+            kill_time = ser.destroyed_time
+            earliest_window = max(0.0, kill_time - INTERCEPTOR_VISUAL_DURATION)
+            latest_window = max(earliest_window, kill_time - INTERCEPTOR_MIN_LEAD)
+            start_time = min(ser.first_motion_time, latest_window)
+            start_time = max(start_time, earliest_window)
+            if kill_time - start_time < INTERCEPTOR_MIN_DURATION:
+                start_time = max(earliest_window, kill_time - INTERCEPTOR_MIN_DURATION)
             interceptor_traces.append(
                 {
                     "marker": marker,
@@ -654,15 +654,16 @@ def _build_animation(state: SwarmDefenseLargeState, output_path: Path, *, time_s
         ha="left",
         bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
     )
-    summary_text = ax.text(
-        0.01,
-        0.04,
-        "\n".join(summary_lines),
+    wave_text = ax.text(
+        0.02,
+        0.98,
+        "",
         transform=ax.transAxes,
-        fontsize=9,
-        va="bottom",
+        fontsize=11,
+        fontweight="bold",
+        va="top",
         ha="left",
-        bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+        bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
     )
     legend_elements = [
         patches.Patch(facecolor="tab:green", edgecolor="black", label="Targets"),
@@ -678,6 +679,35 @@ def _build_animation(state: SwarmDefenseLargeState, output_path: Path, *, time_s
     def _update(frame_idx: int):
         current_time = frame_idx * time_step
         counts = _status_counts(series, target_events, current_time)
+        active_wave_idx = _active_wave_index(wave_timeline, current_time)
+        active_series = series_by_wave.get(active_wave_idx, [])
+        launched_now = sum(1 for ser in active_series if current_time >= ser.start_time)
+        destroyed_now = sum(
+            1
+            for ser in active_series
+            if ser.destroyed_time is not None and current_time >= ser.destroyed_time
+        )
+        ad_losses_now = sum(
+            1
+            for ser in active_series
+            if ser.kill_type == "ad" and ser.destroyed_time is not None and current_time >= ser.destroyed_time
+        )
+        interceptor_losses_now = sum(
+            1
+            for ser in active_series
+            if ser.kill_type == "interceptor" and ser.destroyed_time is not None and current_time >= ser.destroyed_time
+        )
+        active_now = max(0, launched_now - destroyed_now)
+        total_wave = wave_totals.get(active_wave_idx)
+        if total_wave is None:
+            total_wave = wave_stats.get(active_wave_idx, {}).get("launched", 0)
+        if not total_wave:
+            total_wave = len(active_series)
+        wave_text.set_text(
+            f"Wave {active_wave_idx}/{NUM_WAVES}\n"
+            f"Launched: {launched_now}/{total_wave}  Active: {active_now}\n"
+            f"AD losses: {ad_losses_now}  INT losses: {interceptor_losses_now}"
+        )
         status_text.set_text(
             "t={time:.1f}s\nTargets destroyed: {targets}\nAD destroys: {ad}\n"
             "Intercepted: {intercepts}\nActive drones: {active}".format(
@@ -761,7 +791,7 @@ def _build_animation(state: SwarmDefenseLargeState, output_path: Path, *, time_s
             drone_markers
             + path_lines
             + [data["arrow"] for data in ad_arrows]
-            + [status_text, summary_text]
+            + [status_text, wave_text]
         )
         artists.extend(target_base_markers)
         artists.extend(target_kill_markers)
