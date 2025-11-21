@@ -1,1 +1,3 @@
 ALWAYS USE WSL IF NOT ON UBUNTU, OTHERWISE PYSPIEL WILL NOT WORK.
+
+one day i will clean up this repo

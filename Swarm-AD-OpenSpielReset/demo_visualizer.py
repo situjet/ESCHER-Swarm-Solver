@@ -243,11 +243,132 @@ class PolicyWrapper:
         return action
 
 
+def show_state_vector_breakdown(state: SwarmDefenseState, step_name: str = "") -> None:
+    """Show the parts of the state vector that should change.
+    
+    Args:
+        state: The game state to analyze
+        step_name: Optional label for this breakdown
+    """
+    import numpy as np
+    from swarm_defense_game import TOT_CHOICES
+    
+    vec = np.array(state.information_state_tensor(0))
+    
+    # Phase encoding (first 10 values - one-hot for 10 phases)
+    phase_idx = np.where(vec[:10] > 0.5)[0]
+    phase_name = state.phase().name
+    
+    num_targets = state.config.num_targets
+    num_ad_units = state.config.num_ad_units
+    num_drones = state.config.num_attacking_drones
+    
+    # Calculate indices based on structure:
+    # Phase: 0-9 (10 values for 10 phases)
+    # Target positions: 10 to 10+num_targets*2 (row, col pairs)
+    # Target values: 10+num_targets*2 to 10+num_targets*3
+    # AD units: 10+num_targets*3 to 10+num_targets*3+num_ad_units*3 (row, col, alive)
+    # Interceptor info: 1 value (remaining interceptors)
+    # Drone plans: num_drones * 6 (entry_col, target_idx, tot_idx, alive, interceptor_assigned, destroyed_by_interceptor)
+    
+    phase_start, phase_end = 0, 10
+    target_pos_start = 10
+    target_pos_end = target_pos_start + num_targets * 2
+    target_val_start = target_pos_end
+    target_val_end = target_val_start + num_targets
+    ad_start = target_val_end
+    ad_end = ad_start + num_ad_units * 3
+    interceptor_start = ad_end
+    interceptor_end = interceptor_start + 1
+    drone_start = interceptor_end
+    drone_end = drone_start + num_drones * 6
+    
+    print(f"\n  [{step_name}] State Vector Breakdown:")
+    print(f"    Vector length: {len(vec)}")
+    print(f"    Phase (indices {phase_start}-{phase_end-1}): {vec[phase_start:phase_end]} -> {phase_name}")
+    print(f"    Target positions (indices {target_pos_start}-{target_pos_end-1}):")
+    for i in range(num_targets):
+        idx = target_pos_start + i * 2
+        row_val = vec[idx]
+        col_val = vec[idx + 1]
+        row = int(row_val * state.config.grid_rows) if row_val > 0 else None
+        col = int(col_val * state.config.grid_cols) if col_val > 0 else None
+        print(f"      Target {i}: row={row_val:.3f} ({row}), col={col_val:.3f} ({col})")
+    print(f"    Target values (indices {target_val_start}-{target_val_end-1}): {vec[target_val_start:target_val_end]}")
+    print(f"    AD units (indices {ad_start}-{ad_end-1}):")
+    for i in range(num_ad_units):
+        idx = ad_start + i * 3
+        row_val = vec[idx]
+        col_val = vec[idx + 1]
+        alive_val = vec[idx + 2]
+        row = int(row_val * state.config.grid_rows) if row_val > 0 else None
+        col = int(col_val * state.config.grid_cols) if col_val > 0 else None
+        print(f"      AD {i}: row={row_val:.3f} ({row}), col={col_val:.3f} ({col}), alive={alive_val:.1f}")
+    
+    # Interceptor info (only if vector is long enough)
+    if interceptor_start < len(vec):
+        print(f"    Interceptor info (indices {interceptor_start}-{min(interceptor_end-1, len(vec)-1)}): {vec[interceptor_start:min(interceptor_end, len(vec))]}")
+    else:
+        print(f"    Interceptor info: Not yet in vector (vector length: {len(vec)})")
+    
+    # Drone plans (only show what fits in the vector)
+    print(f"    Drone plans (indices {drone_start}-{min(drone_end-1, len(vec)-1)}):")
+    vec_len = len(vec)
+    max_drones_to_show = min(num_drones, (vec_len - drone_start) // 6) if vec_len > drone_start else 0
+    
+    for i in range(max_drones_to_show):
+        idx = drone_start + i * 6
+        if idx + 5 < vec_len:
+            entry_col_val = vec[idx]
+            target_idx_val = vec[idx + 1]
+            tot_idx_val = vec[idx + 2]
+            alive_val = vec[idx + 3]
+            interceptor_assigned_val = vec[idx + 4]
+            destroyed_by_interceptor_val = vec[idx + 5]
+            
+            entry_col = int(entry_col_val * state.config.grid_cols) if entry_col_val > 0 else None
+            target_idx = int(target_idx_val * state.config.drone_target_slots) if target_idx_val > 0 else None
+            tot_idx = int(tot_idx_val * len(TOT_CHOICES)) if tot_idx_val > 0 else None
+            tot = TOT_CHOICES[tot_idx] if tot_idx is not None and tot_idx < len(TOT_CHOICES) else None
+            
+            # Determine target type
+            if target_idx is not None:
+                if target_idx < num_targets:
+                    target_type = f"target:{target_idx}"
+                else:
+                    ad_idx = target_idx - num_targets
+                    target_type = f"ad:{ad_idx}"
+            else:
+                target_type = "None"
+            
+            print(f"      Drone {i}: entry_col={entry_col_val:.3f} ({entry_col}), "
+                  f"target_idx={target_idx_val:.3f} ({target_type}), "
+                  f"tot_idx={tot_idx_val:.3f} ({tot_idx}, ToT={tot}), "
+                  f"alive={alive_val:.1f}, interceptor_assigned={interceptor_assigned_val:.1f}, "
+                  f"destroyed_by_interceptor={destroyed_by_interceptor_val:.1f}")
+    
+    if max_drones_to_show < num_drones:
+        print(f"      ... ({num_drones - max_drones_to_show} more drone slots not yet in vector)")
+    
+    # Show actual state data if available
+    if hasattr(state, '_target_positions') and len(state._target_positions) > 0:
+        print(f"    Target positions (in _target_positions): {state._target_positions}")
+    if hasattr(state, '_targets') and len(state._targets) > 0:
+        print(f"    Actual targets (in _targets): {[(t.row, t.col, t.value) for t in state._targets]}")
+    if hasattr(state, '_ad_units') and len(state._ad_units) > 0:
+        print(f"    Actual AD units (in _ad_units): {[(u.row, u.col, u.alive) for u in state._ad_units]}")
+    if hasattr(state, '_drone_plans') and len(state._drone_plans) > 0:
+        print(f"    Actual drone plans (in _drone_plans):")
+        for i, plan in enumerate(state._drone_plans):
+            target_type = f"target:{plan.target_idx}" if plan.target_idx < num_targets else f"ad:{plan.target_idx - num_targets}"
+            print(f"      Drone {i}: entry=(0,{plan.entry_col}) -> {target_type}, ToT={TOT_CHOICES[plan.tot_idx]}, destroyed_by={plan.destroyed_by}")
+
+
 def load_policy(
     policy_path: Path,
     game: pyspiel.Game,
     device: str = "cpu",
-    policy_layers: Tuple[int, ...] = (256, 128),
+    policy_layers: Optional[Tuple[int, ...]] = None,
 ) -> PolicyNetwork:
     """Load a trained policy network from a checkpoint.
     
@@ -255,13 +376,18 @@ def load_policy(
         policy_path: Path to the .pt file containing policy weights
         game: The OpenSpiel game (needed to get state tensor size)
         device: Device to load model on
-        policy_layers: Architecture of the policy network (must match training)
+        policy_layers: Architecture of the policy network (must match training).
+                       If None, defaults to (256, 128) which is the standard ESCHER architecture.
     
     Returns:
         Loaded PolicyNetwork
     """
     if not POLICY_AVAILABLE:
         raise RuntimeError("PolicyNetwork not available. Make sure ESCHER-Torch is installed.")
+    
+    # Use default architecture if not specified
+    if policy_layers is None:
+        policy_layers = (256, 128)  # Standard ESCHER architecture
     
     # Get dimensions from game
     initial_state = game.new_initial_state()
@@ -290,6 +416,7 @@ def play_episode(
     policy_path_p1: Optional[Path] = None,
     use_sampling: bool = False,
     device: str = "cpu",
+    policy_layers: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[SwarmDefenseState, int]:
     """Play a game episode.
     
@@ -300,6 +427,7 @@ def play_episode(
         policy_path_p1: Optional path to policy.pt file for player 1 (defender)
         use_sampling: If True, sample from policy; if False, take argmax
         device: Device for policy network inference
+        policy_layers: Optional policy network architecture (defaults to (256, 128))
     """
     if seed is None:
         seed = random.SystemRandom().randint(0, 2**31 - 1)
@@ -333,13 +461,13 @@ def play_episode(
     
     if policy_path_p0 is not None:
         print(f"Loading Player 0 (Attacker) policy from: {policy_path_p0}")
-        policy_net_p0 = load_policy(policy_path_p0, game, device=device)
+        policy_net_p0 = load_policy(policy_path_p0, game, device=device, policy_layers=policy_layers)
         policy_wrapper_p0 = PolicyWrapper(policy_net_p0, 0, device=device)
         print(f"✓ Player 0 policy loaded")
     
     if policy_path_p1 is not None:
         print(f"Loading Player 1 (Defender) policy from: {policy_path_p1}")
-        policy_net_p1 = load_policy(policy_path_p1, game, device=device)
+        policy_net_p1 = load_policy(policy_path_p1, game, device=device, policy_layers=policy_layers)
         policy_wrapper_p1 = PolicyWrapper(policy_net_p1, 1, device=device)
         print(f"✓ Player 1 policy loaded")
     
@@ -1332,8 +1460,21 @@ Examples:
     # Handle policy arguments - checkpoint takes precedence
     policy_path_p0 = None
     policy_path_p1 = None
+    policy_layers = None  # Will try to load from metadata if available
     
     if checkpoint_dir:
+        # Try to load policy architecture from metadata
+        metadata_path = checkpoint_dir / "metadata.pt"
+        if metadata_path.exists():
+            try:
+                metadata = torch.load(str(metadata_path), map_location="cpu")
+                # Check if policy_layers is stored in metadata (future-proofing)
+                if "policy_layers" in metadata:
+                    policy_layers = tuple(metadata["policy_layers"])
+                    print(f"📐 Policy architecture from metadata: {policy_layers}")
+            except Exception as e:
+                print(f"Warning: Could not load policy architecture from metadata: {e}")
+        
         # Auto-load policy from checkpoint directory
         policy_path = checkpoint_dir / "policy.pt"
         policy_path_p0 = policy_path
@@ -1375,6 +1516,7 @@ Examples:
         policy_path_p1,
         args.sampling,
         args.device,
+        policy_layers,
     )
     
     # Render visualization
